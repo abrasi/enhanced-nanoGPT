@@ -38,6 +38,151 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.c_proj(y)
         return y
+    
+    
+# Experto
+class FFN(nn.Module):
+    
+    def __init__(self, config):
+        super().__init__()
+        # Capas lineales
+        self.w1 = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.w2 = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.w3 = nn.Linear(config.n_embd, config.n_embd * 4)
+        
+    def forward(self, x):
+        # SwiGLU
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+    
+    
+    
+class MoE(nn.Module):
+    
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_experts > 0
+        self.experts = nn.ModuleList([FFN(config) for _ in range(config.n_experts)])
+        self.gate = nn.Linear(config.n_embd, config.n_experts, bias=False)
+        self.noise_layer = nn.Linear(config.n_embd, config.n_experts, bias=False)
+        
+        self.n_experts_per_tok = config.n_experts_per_tok
+        # Peso para la importancia de los expertos
+        self.w_importance = config.w_importance
+        # Peso para la carga de los expertos, hacer que reciban nº similar de tokens
+        self.w_load = config.w_load
+        
+    
+    # load_loss asegura que todos los expertos reciben ejemplos.
+    # auxiliary_loss asegura que todos los expertos son útiles y no quedan expertos inactivos.
+    
+    
+    # Ensure that each expert receives a similar number of tokens 
+    def get_load_loss(self, x):
+        
+        B, _, _ = x.shape
+        
+        gate_logits = self.gate(x)
+        
+        # Softplus(x * W_noise)
+        softplus = F.softplus(self.noise_layer(x))
+
+        # StandardNormal() * Softplus(x * W_noise)
+        # randn_like genera ruido con media 0 y varianza 1
+        noise = torch.randn_like(gate_logits) * softplus     
+                
+        # H(x) = (x * W_g) + StandardNormal() * Softplus(x * W_noise)
+        noisy_logits = gate_logits + noise
+        
+        kth_values, _ = torch.kthvalue(noisy_logits, self.n_experts_per_tok, dim=-1)
+        
+        # Probabilidad P(x, i) con la CDF de la normal estándar
+        # Es la probabilidad de que el experto i sea seleccionado para el token x
+        normal_dist = torch.distributions.Normal(0, 1)
+        Pi = normal_dist.cdf((gate_logits - kth_values.unsqueeze(-1)) / softplus)
+        
+        # Carga experto
+        # Load = Sum(P(x, i))
+        load = Pi.sum(dim=0) / B   # Normalización (batch_size)
+        
+        mean_load = load.mean()
+        std_load = load.std()
+        cv_squared = (std_load / mean_load) ** 2
+
+        # No se aplica un softmax porque queremos medir la cantidad absoluta de ejemplos que recibe cada experto
+        return self.w_load * cv_squared
+
+        
+    # def get_switch_load_loss(self, x):
+        
+        
+        
+    # Importance-based loss
+    def get_auxiliary_loss(self, gate_logits):
+        
+        probs = F.softmax(gate_logits, dim=-1)
+        
+        importance = probs.sum(dim=0)
+        importance /= importance.sum()  # Normalización
+        
+        # importance = probs.mean(dim=0)
+
+        mean_importance = importance.mean()
+        var_importance = importance.var() # std ** 2
+        
+        cv_squared = var_importance / (mean_importance ** 2)
+        
+        auxiliary_loss = self.w_importance * cv_squared
+        
+        return auxiliary_loss
+
+        
+    def forward(self, x):
+        # Se convierte la dimension a (B*T, C) -> (B*T, n_embd)
+        x_squashed = x.view(-1, x.shape[-1])
+        # (B*T, n_experts) -> por cada token se obtiene un vector de n_experts dimensiones, cada experto tiene una puntuación
+        gate_logits = self.gate(x_squashed)
+        
+        auxiliary_loss = self.get_auxiliary_loss(gate_logits)
+        
+        load_loss = self.get_load_loss(x)
+        print("Load loss:")
+        print(load_loss)
+                
+        # Se seleccionan las top n_experts_per_tok puntuaciones de expertos por token
+        weights, selected_experts = torch.topk(gate_logits, self.n_experts_per_tok)
+        # weights nos dice las top n_experts_per_tok puntuaciones de expertos por token
+        # selected_experts nos dice que top n_experts_per_tok expertos son los seleccionados para cada token
+                    # selected_experts =
+                    # [[0, 2],  # Token 0 → Expertos 0 y 2
+                    # [1, 3],  # Token 1 → Expertos 1 y 3
+                    # [0, 3],  # Token 2 → Expertos 0 y 3
+                    # [1, 2]]  # Token 3 → Expertos 1 y 2
+                          
+        # Aplicamos softmax en la dimension de las filas, por cada token se obtiene un multiplicador para cada experto,
+        # ¿cuanto pondera cada experto en la representación de un token?
+        weights = nn.functional.softmax(
+            weights,
+            dim=1,
+            dtype=torch.float,
+        ).type_as(x)
+        
+        results = torch.zeros_like(x_squashed)
+        for i, expert in enumerate(self.experts):
+            batch_idx, nth_expert = torch.where(selected_experts == i)
+            # batch_idx nos dice a que experto va cada fila, cada token
+            # nth_expert nos dice qué indice en cada fila, cada token, corresponde al experto i
+            
+                    # batch_idx = [0, 3]    # Tokens 0 y 3 van al experto 2
+                    # nth_expert = [1, 1]   # En cada fila, el experto 2 es el segundo seleccionado (índice 1)
+                    
+            # Pasamos los tokens seleccionados al experto i
+            expert_logits = expert(x_squashed[batch_idx])
+            # Multiplicamos la salida del experto por el peso que le corresponde, se añade una dimensión para que las dimensiones sean compatibles
+            # weights[batch_idx, nth_expert, None] contiene las contribuciones del experto i para cada token
+            results[batch_idx] += weights[batch_idx, nth_expert, None] * expert_logits        
+            
+        return results.view_as(x), auxiliary_loss
+        
 
 class MLP(nn.Module):
 
@@ -321,10 +466,11 @@ if torch.cuda.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size
-T = 1024 # sequence length
+total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens, esto viene 64 * 1024 * 8 GPUS
+B = 32 # micro batch size
+T = 512 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+# Aplicamos gradient accumulation por que no podemos hacer un batch de 524288 tokens
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
     print(f"total desired batch size: {total_batch_size}")

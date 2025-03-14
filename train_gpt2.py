@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
+from zeus.monitor import ZeusMonitor
 # -----------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
@@ -703,10 +704,16 @@ log_file = os.path.join(log_dir, f"log.txt")
 with open(log_file, "w") as f: # open for writing to clear the file
     pass
 
+# Monitorización energia de las GPUs
+monitor = ZeusMonitor(gpu_indices=[torch.cuda.current_device()])
+steps = []
+
 for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
+    monitor.begin_window("step")
+    
     # once in a while evaluate our validation loss
     if step % 250 == 0 or last_step:
         model.eval()
@@ -853,6 +860,12 @@ for step in range(max_steps):
     optimizer.step()
     if device_type == "cuda":
         torch.cuda.synchronize() # wait for the GPU to finish work
+        
+    result = monitor.end_window("step")
+    print("Resultado:")
+    print(result)
+    steps.append(result)
+    
     t1 = time.time()
     dt = t1 - t0 # time difference in seconds
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
@@ -861,6 +874,10 @@ for step in range(max_steps):
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss_accum.item():.6f}\n")
+
+avg_time = sum(map(lambda m: m.time, steps)) / len(steps)
+avg_energy = sum(map(lambda m: m.total_energy, steps)) / len(steps)
+print(f"One step took {avg_time} s and {avg_energy} J on average.")
 
 if ddp:
     destroy_process_group()

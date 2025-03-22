@@ -847,30 +847,8 @@ for step in range(max_steps):
     #         if hasattr(block, 'moe_layer'): 
     #             update_moe_layer_bias(block.moe_layer, gamma)
     #--------------------------------           
-    
-    # Expert assigment count
-    counts = []
-    local_mean = None
-    for block in model.module.transformer.h:
-        # Se verifica que el bloque tenga un moe_layer con assignment_count actualizado
-        if hasattr(block, 'moe_layer') and hasattr(block.moe_layer, 'assignment_count'):
-            counts.append(block.moe_layer.assignment_count)
-    if counts:
-        # Stack: obtiene un tensor de forma (n_blocks, n_experts)
-        counts_stack = torch.stack(counts, dim=0)
-        # Promedio a lo largo de los bloques (dim=0)
-        local_mean = counts_stack.float().mean(dim=0)
-        
-    if local_mean is not None:
-        if ddp:
-            dist.all_reduce(local_mean, op=dist.ReduceOp.AVG)
-            total_tokens = B * T
-            total_assigment = local_mean.sum()
-            dropped_tokens = total_tokens - total_assigment
-            assignment_percentage = local_mean.float() / float(total_tokens)
-            dropped_percentage = float(dropped_tokens) / total_tokens
-    # -----------------------
             
+    counts_accum = []
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
@@ -887,6 +865,41 @@ for step in range(max_steps):
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
         loss.backward()
+        
+    # Expert assigment count
+        counts = []
+        for block in model.module.transformer.h:
+            if hasattr(block, 'moe_layer') and hasattr(block.moe_layer, 'assignment_count'):
+                # Cada assignment_count tiene forma (n_experts,)
+                counts.append(block.moe_layer.assignment_count)
+        if counts:
+            # Convertimos la lista a un tensor de forma (n_blocks, n_experts)
+            counts_stack = torch.stack(counts, dim=0)  
+            counts_accum.append(counts_stack)
+
+    if counts_accum:
+        # Acumulamos a lo largo de los micro_steps: 
+        #   -> torch.stack(counts_accum, dim=0) tendrá forma (grad_accum_steps, n_blocks, n_experts)
+        # Sumamos sobre el eje de los micro_steps para obtener (n_blocks, n_experts)
+        counts_tensor = torch.stack(counts_accum, dim=0).float().sum(dim=0)
+        print("Counts tensor", counts_tensor)
+        # Luego, promediamos entre bloques para obtener el número de asignaciones "por token" en el batch real
+        local_total = counts_tensor.mean(dim=0)  # Tensor de forma (n_experts,)
+        print("Local total", local_total)
+        
+        if ddp:
+            dist.all_reduce(local_total, op=dist.ReduceOp.AVG)
+        
+        # Número real de tokens en el batch: cada micro_step procesa B*T tokens
+        total_tokens = B * T * grad_accum_steps
+        # Los tokens descartados se calculan como la diferencia entre el total de tokens y la suma de asignaciones (por token)
+        dropped_tokens = max(0, total_tokens - local_total.sum())
+        
+        # Porcentaje de asignación por experto y porcentaje de tokens descartados
+        assignment_percentage = local_total / float(total_tokens)
+        dropped_percentage = float(dropped_tokens) / total_tokens
+    # -----------------------
+
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

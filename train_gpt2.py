@@ -72,10 +72,10 @@ class SwitchMoE(nn.Module):
         
         
     def get_z_loss(self, router_logits):
-        num_groups, tokens_per_group, _ = router_logits.shape
+        _, tokens, _ = router_logits.shape
         log_z = torch.logsumexp(router_logits, dim=-1)
         z_loss = log_z**2
-        return torch.sum(z_loss) / (num_groups * tokens_per_group)
+        return torch.sum(z_loss) / tokens
         
         
     def get_load_balance_loss(self, router_probs, expert_onehot):
@@ -100,9 +100,13 @@ class SwitchMoE(nn.Module):
         
     def route(self, x):
         
-        router_logits = self.router(x)
+        B, T, C = x.shape
         
-        z_loss = self.get_z_loss(router_logits) * self.lambda_z
+        x_flat = x.view(B*T, C)
+        
+        router_logits = self.router(x_flat)
+        
+        z_loss = self.get_z_loss(router_logits.unsqueeze(0)) * self.lambda_z
         
         router_probs = F.softmax(
             router_logits,
@@ -118,7 +122,7 @@ class SwitchMoE(nn.Module):
         
         # Vamos acumulando el numero de tokens que recibe cada experto,
         # cada fila representa el numero de tokens que ha recibido cada experto hasta ese momento
-        token_priority = torch.cumsum(expert_index, dim=-2)
+        token_priority = torch.cumsum(expert_index, dim=0)
 
         # Se crea una mascara con booleanos, indica si cada experto puede recibir más tokens, si no puede será False su valor
         expert_capacity_mask = token_priority <= self.expert_capacity
@@ -136,45 +140,40 @@ class SwitchMoE(nn.Module):
         # Al multiplicar por la mascara anterior se anularán las filas de expertos que no pueden recibir más tokens
         expert_index = expert_index * expert_capacity_mask
         
-        self.assignment_count = expert_index.sum(dim=-2).sum(dim=0)
-
+        self.assignment_count = expert_index.sum(dim=0)
+        
         # Para calcular el loss empleamos el tensor onehot de expertos seleccionados y las puntuaciones de los expertos
         load_balance_loss = self.get_load_balance_loss(router_probs, expert_index)
 
         # Nos quedamos con las puntuaciones de los expertos que pueden recibir tokens
         router_probs = torch.max(router_probs, dim=-1).values.unsqueeze(-1)    
            
-        return expert_index, router_probs, load_balance_loss + z_loss
+        return expert_index, router_probs, load_balance_loss + z_loss, x_flat, B, T
          
     def forward(self, x):
         
-        router_mask, router_probs, auxiliary_loss = self.route(x)
+        expert_index, router_probs, auxiliary_loss, x_flat, B, T = self.route(x)
         
         # Indices de los expertos seleccionados
         # expert_index = torch.argmax(router_mask, dim=-1)
         
         # Clonamos las entradas porque hay tokens que no se procesarán -> Dropped tokens
-        next_states = x.clone()
+        next_states = x_flat.clone()
         
-        router_mask = router_mask.bool()
-        
-        B, T, C = router_mask.shape
-        
-        # Con esto sumamos el nº de tokens que ha recibido cada experto
-        idx_mask = router_mask.reshape(B*T, C).sum(dim=0)
-        
-        # Aquí se obtienen los expertos que han recibido tokens, los que han sumado 0 tokens se descartan en nonzero
-        idx_mask = torch.nonzero(idx_mask, as_tuple=True)[0].tolist()
-        
-        for idx in idx_mask:
-            # router_mask[:, :, idx] devuelve un array que indica para el experto idx, qué tokens se le asignan
-            next_states[router_mask[:, :, idx]] = self.experts[idx](x[router_mask[:, :, idx]]).type_as(x)
-        
+        for idx in range(self.n_experts):
+            
+            expert_mask = expert_index[:, idx].bool()
+            if expert_mask.sum() > 0:
+                next_states[expert_mask] = self.experts[idx](x_flat[expert_mask]).type_as(x)
+                
+        next_states = next_states.view(B, T, -1)
+        router_probs = router_probs.view(B, T, 1)
+            
         # La salida se multiplica por la probabilidad de cada experto
         # Duda: tiene sentido multiplicar por la probabilidad de cada experto si hay tokens que no se envían a ningún experto?
         x = router_probs * next_states
         
-        return x, auxiliary_loss 
+        return x, auxiliary_loss  
 
     
     
@@ -372,7 +371,7 @@ class GPTConfig:
     w_importance: float = 0.1
     w_load: float = 0.01
     lambda_z: float = 0.001
-    expert_capacity: int = 64 # = expert_capacity =  (T / n_experts) * capacity_factor, usamos T en vez de B*T por la forma en que se hace forward en SwitchMoE
+    expert_capacity: int = 1536 # = expert_capacity =  (B*T / n_experts) * capacity_factor = 1.5, usamos T en vez de B*T por la forma en que se hace forward en SwitchMoE
 
 class GPT(nn.Module):
 

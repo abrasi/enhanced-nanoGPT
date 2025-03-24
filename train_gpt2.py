@@ -114,40 +114,37 @@ class SwitchMoE(nn.Module):
             dtype=torch.float,
         ).type_as(x)
         
-        # Tensor como indices de los expertos seleccionados
-        expert_index = torch.argmax(router_probs, dim=-1)
-
-        # Se convierte el indice del experto en un vector one-hot, hay 1 en la posición del experto seleccionado, 0 en las demás
-        expert_index = F.one_hot(expert_index, num_classes=self.n_experts)
+        top2_experts = torch.topk(router_probs, 2, dim=-1)
+        first_choice = top2_experts.indices[:, 0]
+        second_choice = top2_experts.indices[:, 1]
         
-        # Vamos acumulando el numero de tokens que recibe cada experto,
-        # cada fila representa el numero de tokens que ha recibido cada experto hasta ese momento
-        token_priority = torch.cumsum(expert_index, dim=0)
-
-        # Se crea una mascara con booleanos, indica si cada experto puede recibir más tokens, si no puede será False su valor
+        # Tensores onehot para los expertos seleccionados, tanto primera opcion como segunda
+        first_expert_index = F.one_hot(first_choice, num_classes=self.n_experts)
+        second_expert_index = F.one_hot(second_choice, num_classes=self.n_experts)
+        
+        # Mascara para la capacidad de los expertos
+        token_priority = torch.cumsum(first_expert_index, dim=0)
         expert_capacity_mask = token_priority <= self.expert_capacity
 
-        # Ejemplo:
-            # tensor([[
-            #  [ True,  True,  True,  True], # al principio todos los expertos pueden recibir tokens
-            #  [ True,  True,  True,  True],
-            #  [ True,  True,  True,  True],
-            #  ...,
-            #  [False, False, False, False],
-            #  [False, False, False, False],
-            #  [False, False, False, False]],
-        
-        # Al multiplicar por la mascara anterior se anularán las filas de expertos que no pueden recibir más tokens
-        expert_index = expert_index * expert_capacity_mask
-        
-        self.assignment_count = expert_index.sum(dim=0)
-        
-        # Para calcular el loss empleamos el tensor onehot de expertos seleccionados y las puntuaciones de los expertos
-        load_balance_loss = self.get_load_balance_loss(router_probs, expert_index)
+        # Intentamos asignar primero a first_expert
+        assigned_first = first_expert_index * expert_capacity_mask
+        dropped_tokens = (assigned_first.sum(dim=-1) == 0)  # Tokens no asignados
 
-        # Nos quedamos con las puntuaciones de los expertos que pueden recibir tokens
-        router_probs = torch.max(router_probs, dim=-1).values.unsqueeze(-1)    
-           
+        # Ahora intentamos asignar los `dropped_tokens` al segundo experto
+        token_priority_second = torch.cumsum(second_expert_index, dim=0)
+        expert_capacity_mask_second = token_priority_second <= self.expert_capacity
+        assigned_second = second_expert_index * expert_capacity_mask_second * dropped_tokens.unsqueeze(-1)
+
+        # Combinar asignaciones: tokens que no entraron en el primero intentan entrar en el segundo
+        expert_index = assigned_first + assigned_second
+        
+        self.first_expert_assigment_count = assigned_first.sum(dim=0)
+        self.total_assigment_count = expert_index.sum(dim=0)
+
+        # Pérdidas auxiliares
+        load_balance_loss = self.get_load_balance_loss(router_probs, expert_index)
+        router_probs = torch.max(router_probs, dim=-1).values.unsqueeze(-1)
+
         return expert_index, router_probs, load_balance_loss + z_loss, x_flat, B, T
          
     def forward(self, x):
@@ -369,7 +366,7 @@ class GPTConfig:
     n_experts: int = 4
     n_experts_per_tok: int = 2
     w_importance: float = 0.1
-    w_load: float = 0.01
+    w_load: float = 0.1
     lambda_z: float = 0.001
     expert_capacity: int = 1536 # = expert_capacity =  (B*T / n_experts) * capacity_factor = 1.5, usamos T en vez de B*T por la forma en que se hace forward en SwitchMoE
 
@@ -848,25 +845,35 @@ for step in range(max_steps):
     #--------------------------------           
     
     # Expert assigment count
-    counts = []
-    local_mean = None
+    first_assigment_counts = []
+    total_assigment_count = []
+    # Promedio de conteo de asignaciones a expertos en todas los bloques transformer
+    fist_assigment_mean = None
+    # Recogemos los conteos de asignaciones a expertos de todas las capas MoE 
     for block in model.module.transformer.h:
-        # Se verifica que el bloque tenga un moe_layer con assignment_count actualizado
-        if hasattr(block, 'moe_layer') and hasattr(block.moe_layer, 'assignment_count'):
-            counts.append(block.moe_layer.assignment_count)
-    if counts:
-        # Stack: obtiene un tensor de forma (n_blocks, n_experts)
-        counts_stack = torch.stack(counts, dim=0)
-        # Promedio a lo largo de los bloques (dim=0)
-        local_mean = counts_stack.float().mean(dim=0)
         
-    if local_mean is not None:
+        if hasattr(block, 'moe_layer') and hasattr(block.moe_layer, 'first_expert_assigment_count'):
+            first_assigment_counts.append(block.moe_layer.first_expert_assigment_count)
+            total_assigment_count.append(block.moe_layer.total_assigment_count)
+            
+    if first_assigment_counts:
+        # Stack: obtiene un tensor de forma (n_layer, n_experts)
+        # 2 tensores: uno para la asignación del primer experto y otro para la asignación a la primera y segunda opción
+        first_assigment_counts_stack = torch.stack(first_assigment_counts, dim=0)
+        total_assigment_count_stack = torch.stack(total_assigment_count, dim=0)
+        # Promedio a lo largo de los bloques transformer (dim=0)
+        fist_assigment_mean = first_assigment_counts_stack.float().mean(dim=0)
+        total_mean = total_assigment_count_stack.float().mean(dim=0)
+                
+    if fist_assigment_mean is not None:
         if ddp:
-            dist.all_reduce(local_mean, op=dist.ReduceOp.AVG)
+            # Se promedian los tokens recibidos por los expertos entre las GPUs
+            dist.all_reduce(fist_assigment_mean, op=dist.ReduceOp.AVG)
+            dist.all_reduce(total_mean, op=dist.ReduceOp.AVG)
             total_tokens = B * T
-            total_assigment = local_mean.sum()
+            total_assigment = total_mean.sum()
             dropped_tokens = total_tokens - total_assigment
-            assignment_percentage = local_mean.float() / float(total_tokens)
+            first_assignment_percentage = fist_assigment_mean.float() / float(total_tokens)
             dropped_percentage = float(dropped_tokens) / total_tokens
     # -----------------------
             
@@ -907,7 +914,7 @@ for step in range(max_steps):
     if master_process:
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
         with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum.item():.6f}, expert assigment percentage: {assignment_percentage.tolist()}, dropped tokens: {dropped_tokens} ({dropped_percentage * 100:.2f}%)\n")
+            f.write(f"{step} train {loss_accum.item():.6f}, first expert assigment percentage: {first_assignment_percentage.tolist()}, dropped tokens: {dropped_tokens} ({dropped_percentage * 100:.2f}%)\n")
 mes = monitor.end_window("epoch")
 
 avg_time = sum(map(lambda m: m.time, steps)) / len(steps)

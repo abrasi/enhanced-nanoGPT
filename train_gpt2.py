@@ -839,7 +839,7 @@ for step in range(max_steps):
     optimizer.zero_grad()
     
     # Actualización de bias para MoE
-    if step >= bias_update_step:
+    if step == bias_update_step:
         gamma = 0.0
         if master_process:
             print("Zeroed out the bias update speed in the MoE layer -> 97% of training done")

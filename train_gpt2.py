@@ -58,120 +58,135 @@ class FFN(nn.Module):
         return x
     
     
-# class SwitchMoE(nn.Module):
+class SwitchMoE(nn.Module):
     
-#     def __init__(self, config):
-#         super().__init__()
-#         self.router = nn.Linear(config.n_embd, config.n_experts, bias=False)
-#         self.expert_capacity = config.expert_capacity
-#         self.experts = nn.ModuleList([FFN(config) for _ in range(config.n_experts)])
-#         self.n_experts = config.n_experts
+    def __init__(self, config):
+        super().__init__()
+        self.router = nn.Linear(config.n_embd, config.n_experts, bias=False)
+        self.expert_capacity = config.expert_capacity
+        self.experts = nn.ModuleList([FFN(config) for _ in range(config.n_experts)])
+        self.n_experts = config.n_experts
         
-#         self.w_load = config.w_load
-#         self.lambda_z = config.lambda_z
-        
-        
-#     def get_z_loss(self, router_logits):
-#         _, tokens, _ = router_logits.shape
-#         log_z = torch.logsumexp(router_logits, dim=-1)
-#         z_loss = log_z**2
-#         return torch.sum(z_loss) / tokens
+        self.w_load = config.w_load
+        self.lambda_z = config.lambda_z
         
         
-#     def get_load_balance_loss(self, router_probs, expert_onehot):
+    def get_z_loss(self, router_logits):
+        _, tokens, _ = router_logits.shape
+        log_z = torch.logsumexp(router_logits, dim=-1)
+        z_loss = log_z**2
+        return torch.sum(z_loss) / tokens
         
-#         """
-#         router_probs: Tensor que representa la probabilidad de que un token sea enviado a cada experto -> dimension (B, T, n_experts)
-#         expert_onehot: Tensor que representa el experto seleccionado para cada token -> dimension (B, T, n_experts)
-#         """
         
-#         expert_onehot = expert_onehot.reshape(-1, self.n_experts)
-#         router_probs = router_probs.reshape(-1, self.n_experts)
+    def get_load_balance_loss(self, router_probs, expert_onehot):
         
-#         # Tensor que representa la fraccion de los tokens enviados a cada experto -> dimension (n_experts, 1)
-#         f_i = expert_onehot.float().mean(dim=0)
-#         # NOTA: la suma de las fracciones entre los expertos no tiene por qué ser 1, porque hay tokens que no se envían a ningún experto -> Dropped Tokens
+        """
+        router_probs: Tensor que representa la probabilidad de que un token sea enviado a cada experto -> dimension (B, T, n_experts)
+        expert_onehot: Tensor que representa el experto seleccionado para cada token -> dimension (B, T, n_experts)
+        """
         
-#         # Representa la probabilidad total de que un token sea enviado a cada experto -> dimension (n_experts, 1)
-#         P_i = router_probs.mean(dim=0)
+        expert_onehot = expert_onehot.reshape(-1, self.n_experts)
+        router_probs = router_probs.reshape(-1, self.n_experts)
+        
+        # Tensor que representa la fraccion de los tokens enviados a cada experto -> dimension (n_experts, 1)
+        f_i = expert_onehot.float().mean(dim=0)
+        # NOTA: la suma de las fracciones entre los expertos no tiene por qué ser 1, porque hay tokens que no se envían a ningún experto -> Dropped Tokens
+        
+        # Representa la probabilidad total de que un token sea enviado a cada experto -> dimension (n_experts, 1)
+        P_i = router_probs.mean(dim=0)
 
-#         return self.w_load * self.n_experts * torch.sum(f_i * P_i)
+        return self.w_load * self.n_experts * torch.sum(f_i * P_i)
         
         
-#     def route(self, x):
+    def route(self, x):
         
-#         B, T, C = x.shape
+        B, T, C = x.shape
         
-#         x_flat = x.view(B*T, C)
+        x_flat = x.view(B*T, C)
         
-#         router_logits = self.router(x_flat)
+        router_logits = self.router(x_flat)
         
-#         z_loss = self.get_z_loss(router_logits.unsqueeze(0)) * self.lambda_z
+        z_loss = self.get_z_loss(router_logits.unsqueeze(0)) * self.lambda_z
         
-#         router_probs = F.softmax(
-#             router_logits,
-#             dim=-1,
-#             dtype=torch.float,
-#         ).type_as(x)
+        router_probs = F.softmax(
+            router_logits,
+            dim=-1,
+            dtype=torch.float,
+        ).type_as(x)
         
-#         top2_experts = torch.topk(router_probs, 2, dim=-1)
-#         first_choice = top2_experts.indices[:, 0]
-#         second_choice = top2_experts.indices[:, 1]
+        top2_experts = torch.topk(router_probs, 2, dim=-1)
+        first_choice = top2_experts.indices[:, 0]
+        second_choice = top2_experts.indices[:, 1]
         
-#         # Tensores onehot para los expertos seleccionados, tanto primera opcion como segunda
-#         first_expert_index = F.one_hot(first_choice, num_classes=self.n_experts)
-#         second_expert_index = F.one_hot(second_choice, num_classes=self.n_experts)
+        # Tensores onehot para los expertos seleccionados, tanto primera opcion como segunda
+        first_expert_index = F.one_hot(first_choice, num_classes=self.n_experts)
+        second_expert_index = F.one_hot(second_choice, num_classes=self.n_experts)
         
-#         # Mascara para la capacidad de los expertos
-#         token_priority = torch.cumsum(first_expert_index, dim=0)
-#         expert_capacity_mask = token_priority <= self.expert_capacity
+        # Mascara para la capacidad de los expertos
+        token_priority = torch.cumsum(first_expert_index, dim=0)
+        expert_capacity_mask = token_priority <= self.expert_capacity
 
-#         # Intentamos asignar primero a first_expert
-#         assigned_first = first_expert_index * expert_capacity_mask
-#         dropped_tokens = (assigned_first.sum(dim=-1) == 0)  # Tokens no asignados
+        # Intentamos asignar primero a first_expert
+        assigned_first = first_expert_index * expert_capacity_mask
+        dropped_tokens = (assigned_first.sum(dim=-1) == 0)  # Tokens no asignados
 
-#         # Ahora intentamos asignar los `dropped_tokens` al segundo experto
-#         token_priority_second = torch.cumsum(second_expert_index, dim=0)
-#         expert_capacity_mask_second = token_priority_second <= self.expert_capacity
-#         assigned_second = second_expert_index * expert_capacity_mask_second * dropped_tokens.unsqueeze(-1)
+        # Ahora intentamos asignar los `dropped_tokens` al segundo experto
+        token_priority_second = torch.cumsum(second_expert_index, dim=0)
+        expert_capacity_mask_second = token_priority_second <= self.expert_capacity
+        assigned_second = second_expert_index * expert_capacity_mask_second * dropped_tokens.unsqueeze(-1)
 
-#         # Combinar asignaciones: tokens que no entraron en el primero intentan entrar en el segundo
-#         expert_index = assigned_first + assigned_second
+        # Combinar asignaciones: tokens que no entraron en el primero intentan entrar en el segundo
+        expert_index = assigned_first + assigned_second
         
-#         self.first_expert_assigment_count = assigned_first.sum(dim=0)
-#         self.total_assigment_count = expert_index.sum(dim=0)
+        self.first_expert_assigment_count = assigned_first.sum(dim=0)
+        self.total_assigment_count = expert_index.sum(dim=0)
 
-#         # Pérdidas auxiliares
-#         load_balance_loss = self.get_load_balance_loss(router_probs, expert_index)
-#         router_probs = torch.max(router_probs, dim=-1).values.unsqueeze(-1)
+        # Pérdidas auxiliares
+        load_balance_loss = self.get_load_balance_loss(router_probs, expert_index)
+        router_probs = torch.max(router_probs, dim=-1).values.unsqueeze(-1)
 
-#         return expert_index, router_probs, load_balance_loss + z_loss, x_flat, B, T
+        return expert_index, router_probs, load_balance_loss + z_loss, x_flat, B, T
          
-#     def forward(self, x):
+    def forward(self, x):
         
-#         expert_index, router_probs, auxiliary_loss, x_flat, B, T = self.route(x)
+        expert_index, router_probs, auxiliary_loss, x_flat, B, T = self.route(x)
         
-#         # Indices de los expertos seleccionados
-#         # expert_index = torch.argmax(router_mask, dim=-1)
+        # Indices de los expertos seleccionados
+        # expert_index = torch.argmax(router_mask, dim=-1)
         
-#         # Clonamos las entradas porque hay tokens que no se procesarán -> Dropped tokens
-#         next_states = x_flat.clone()
+        # Clonamos las entradas porque hay tokens que no se procesarán -> Dropped tokens
+        next_states = x_flat.clone()
         
-#         for idx in range(self.n_experts):
+        for idx in range(self.n_experts):
             
-#             expert_mask = expert_index[:, idx].bool()
-#             if expert_mask.sum() > 0:
-#                 next_states[expert_mask] = self.experts[idx](x_flat[expert_mask]).type_as(x)
+            expert_mask = expert_index[:, idx].bool()
+            if expert_mask.sum() > 0:
+                next_states[expert_mask] = self.experts[idx](x_flat[expert_mask]).type_as(x)
                 
-#         next_states = next_states.view(B, T, -1)
-#         router_probs = router_probs.view(B, T, 1)
+        next_states = next_states.view(B, T, -1)
+        router_probs = router_probs.view(B, T, 1)
             
-#         # La salida se multiplica por la probabilidad de cada experto
-#         # Duda: tiene sentido multiplicar por la probabilidad de cada experto si hay tokens que no se envían a ningún experto?
-#         x = router_probs * next_states
+        # La salida se multiplica por la probabilidad de cada experto
+        # Duda: tiene sentido multiplicar por la probabilidad de cada experto si hay tokens que no se envían a ningún experto?
+        x = router_probs * next_states
         
-#         return x, auxiliary_loss  
+        return x, auxiliary_loss  
   
+  
+class MixtralMoE(nn.Module):
+    
+    def __init__(self, config):
+        super().__init__()
+        self.router = nn.Linear(config.n_embd, config.n_experts, bias=False)
+        self.expert_capacity = config.expert_capacity
+        self.experts = nn.ModuleList([FFN(config) for _ in range(config.n_experts)])
+        self.n_experts = config.n_experts
+        
+        self.w_load = config.w_load
+        self.lambda_z = config.lambda_z
+        
+    def forward():
+        return
     
 # num decayed parameter tensors: 146, with 294,297,600 parameters
 # num non-decayed parameter tensors: 170, with 259,584 parameters
@@ -192,91 +207,94 @@ class MoE(nn.Module):
         self.w_load = config.w_load
         self.importance_loss = 0.0
         self.load_loss = 0.0
-        # self.lambda_z = config.lambda_z
+        self.lambda_z = config.lambda_z
 
-        self.bias = nn.Parameter(torch.empty(self.n_experts))
+        # self.bias = nn.Parameter(torch.empty(self.n_experts))
         
     
     # load_loss asegura que todos los expertos reciben ejemplos.
     # auxiliary_loss asegura que todos los expertos son útiles y no quedan expertos inactivos.
+    def get_kth_excluding(self, gate_logits):
+        """
+        Calcula kth_excluding(H(x), k, i) para cada experto i en el gating network.
+
+        gate_logits: [batch*seq_len, n_experts] (logits antes de softmax)
+        k: número de expertos a seleccionar por token
+        """
+        
+        # Expandir logits para comparación (agregar una dimensión extra para simular exclusión)
+        expanded_logits = gate_logits.unsqueeze(1).expand(-1, self.n_experts, -1)  # [B*T, n_experts, n_experts]
+
+        # Crear una máscara para excluir cada experto i
+        mask = torch.eye(self.n_experts, device=gate_logits.device).bool()  # [n_experts, n_experts]
+        masked_logits = expanded_logits.masked_fill(mask, float('-inf'))  # Reemplazar la diagonal con -inf
+
+        # Obtener el k-ésimo mayor excluyendo cada experto i
+        kth_values, _ = torch.topk(masked_logits, self.n_experts_per_tok, dim=2)  # [B*T, n_experts, k]
+        kth_excluding_values = kth_values[:, :, -1]  # Última columna es el k-ésimo mayor excluyendo i
+
+        return kth_excluding_values
+        
     
     # Ensure that each expert receives a similar number of tokens 
-    def get_load_loss(self, x):
+    def get_load_loss(self, gate_logits, noise_std):
+                        
+        kth_excluding = self.get_kth_excluding(gate_logits)
         
-        B, _, _ = x.shape
+        normal_cdf = torch.distributions.Normal(0, 1).cdf
+        P_xi = normal_cdf((gate_logits - kth_excluding) / noise_std)
         
-        gate_logits = self.gate(x)
-        
-        # Softplus(x * W_noise)
-        softplus = F.softplus(self.noise_layer(x))
+        Load_X = P_xi.sum(dim=0)
 
-        # StandardNormal() * Softplus(x * W_noise)
-        # randn_like genera ruido con media 0 y varianza 1
-        noise = torch.randn_like(gate_logits) * softplus     
-                
-        # H(x) = (x * W_g) + StandardNormal() * Softplus(x * W_noise)
-        noisy_logits = gate_logits + noise
+        mean_load = Load_X.mean()
+        std_load = Load_X.std()
+        CV = std_load / mean_load
         
-        kth_values, _ = torch.kthvalue(noisy_logits, self.n_experts_per_tok, dim=-1)
-        
-        # Probabilidad P(x, i) con la CDF de la normal estándar
-        # Es la probabilidad de que el experto i sea seleccionado para el token x
-        normal_dist = torch.distributions.Normal(0, 1)
-        Pi = normal_dist.cdf((gate_logits - kth_values.unsqueeze(-1)) / softplus)
-        
-        # Carga experto
-        # Load = Sum(P(x, i))
-        load = Pi.sum(dim=0) / B   # Normalización (batch_size)
-        
-        mean_load = load.mean()
-        std_load = load.std()
-        cv_squared = (std_load / mean_load) ** 2
-
-        # No se aplica un softmax porque queremos medir la cantidad absoluta de ejemplos que recibe cada experto
-        return self.w_load * cv_squared         
+        # Compute load balancing loss
+        L_load = self.w_load * (CV ** 2)
+        return L_load       
         
     # Importance-based loss
-    def get_auxiliary_loss(self, gate_logits):
+    def get_auxiliary_loss(self, probs, selected_experts):
+    
+        # Tenemos un tensor probs de forma (B*T, n_experts_per_tok) y necesitamos uno de forma (B*T, n_experts)
+        B_T, _ = probs.shape
+        probs_expanded = torch.zeros(B_T, self.n_experts, device=probs.device, dtype=probs.dtype)
         
-        probs = F.softmax(gate_logits, dim=-1)
+        # Esta operacion introduce a la dimensión 1, en los índices selected_experts, los pesos de los expertos probs
+        probs_expanded.scatter_(1, selected_experts, probs)
         
-        importance = probs.sum(dim=0)
-        importance /= importance.sum()  # Normalización
+        importance = probs_expanded.sum(dim=0)
         
-        # importance = probs.mean(dim=0)
-
-        mean_importance = importance.mean()
-        var_importance = importance.var() # std ** 2
+        cv_squared = torch.var(importance) / torch.mean(importance) ** 2
         
-        cv_squared = var_importance / (mean_importance ** 2)
-        
-        auxiliary_loss = self.w_importance * cv_squared
-        
-        return auxiliary_loss
+        return self.w_importance * cv_squared
     
     # St-MoE, penaliza logits muy grandes
     
-    # def get_z_loss(self, gate_logits):
+    def get_z_loss(self, gate_logits):
         
-    #     logsumexp = torch.logsumexp(gate_logits, dim=-1)
-    #     loss = torch.mean(logsumexp ** 2)
-    #     return self.lambda_z * loss
+        logsumexp = torch.logsumexp(gate_logits, dim=-1)
+        loss = torch.mean(logsumexp ** 2)
+        return self.lambda_z * loss
 
         
     def forward(self, x):
-        # Se convierte la dimension a (B*T, C) -> (B*T, n_embd)
+        # Se convierte la dimension a (B*T, C) -> (B*T, n_embd)        
         x_squashed = x.view(-1, x.shape[-1])
+        
         # (B*T, n_experts) -> por cada token se obtiene un vector de n_experts dimensiones, cada experto tiene una puntuación
         gate_logits = self.gate(x_squashed)
         
-        # BIAS de DeepSeek
-        gate_logits += self.bias
-        
         # z_loss = self.get_z_loss(gate_logits)
         
-        self.importance_loss = self.get_auxiliary_loss(gate_logits)
+        noise_std = F.softplus(self.noise_layer(x_squashed))
+        gate_logits += torch.randn_like(gate_logits) * noise_std
         
-        self.load_loss = self.get_load_loss(x)
+        # BIAS de DeepSeek
+        # gate_logits += self.bias
+        
+        self.load_loss = self.get_load_loss(gate_logits, noise_std)
                 
         # Se seleccionan las top n_experts_per_tok puntuaciones de expertos por token
         weights, selected_experts = torch.topk(gate_logits, self.n_experts_per_tok)
@@ -294,7 +312,9 @@ class MoE(nn.Module):
             weights,
             dim=1,
             dtype=torch.float,
-        ).type_as(x)      
+        ).type_as(x)    
+        
+        self.importance_loss = self.get_auxiliary_loss(weights, selected_experts)
         
         self.total_assigment_count = torch.zeros(self.n_experts, device=x.device, dtype=torch.int32)
 
@@ -308,30 +328,16 @@ class MoE(nn.Module):
             
                     # batch_idx = [0, 3]    # Tokens 0 y 3 van al experto 2
                     # nth_expert = [1, 1]   # En cada fila, el experto 2 es el segundo seleccionado (índice 1)
-                    
-            # Pasamos los tokens seleccionados al experto i
-            expert_logits = expert(x_squashed[batch_idx])
-            # Multiplicamos la salida del experto por el peso que le corresponde, se añade una dimensión para que las dimensiones sean compatibles
-            # weights[batch_idx, nth_expert, None] contiene las contribuciones del experto i para cada token
-            results[batch_idx] += weights[batch_idx, nth_expert, None] * expert_logits
+            
+            if len(batch_idx) > 0:
+                # Pasamos los tokens seleccionados al experto i
+                expert_logits = expert(x_squashed[batch_idx])
+                # Multiplicamos la salida del experto por el peso que le corresponde, se añade una dimensión para que las dimensiones sean compatibles
+                # weights[batch_idx, nth_expert, None] contiene las contribuciones del experto i para cada token
+                results[batch_idx] += weights[batch_idx, nth_expert, None] * expert_logits
                         
         return results.view_as(x), self.importance_loss + self.load_loss
         
-
-# class MLP(nn.Module):
-
-#     def __init__(self, config):
-#         super().__init__()
-#         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
-#         self.gelu    = nn.GELU(approximate='tanh')
-#         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
-#         self.c_proj.NANOGPT_SCALE_INIT = 1
-
-#     def forward(self, x):
-#         x = self.c_fc(x)
-#         x = self.gelu(x)
-#         x = self.c_proj(x)
-#         return x
 
 class Block(nn.Module):
 
@@ -340,7 +346,10 @@ class Block(nn.Module):
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        self.moe_layer = MoE(config)
+        if config.expert_implementation == "MoE":
+            self.moe_layer = MoE(config)
+        elif config.expert_implementation == "SwitchMoE":
+            self.moe_layer = SwitchMoE(config)
         # self.mlp = MLP(config)
 
     def forward(self, x):
@@ -361,7 +370,8 @@ class GPTConfig:
     n_experts_per_tok: int = 2
     w_importance: float = 0.1
     w_load: float = 0.1
-    # lambda_z: float = 0.001
+    expert_implementation: str = "MoE"
+    lambda_z: float = 0.001
     # expert_capacity: int = 1536 # = expert_capacity =  (B*T / n_experts) * capacity_factor = 1.5, usamos T en vez de B*T por la forma en que se hace forward en SwitchMoE
 
 class GPT(nn.Module):
@@ -576,363 +586,365 @@ def get_most_likely_row(tokens, mask, logits):
     return pred_norm
 
 # -----------------------------------------------------------------------------
-# simple launch:
-# python train_gpt2.py
-# DDP launch for e.g. 8 GPUs:
-# torchrun --standalone --nproc_per_node=8 train_gpt2.py
 
-# run the training loop
-from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
-
-# set up DDP (distributed data parallel).
-# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-if ddp:
-    # use of DDP atm demands CUDA, we set the device appropriately according to rank
-    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-    init_process_group(backend='nccl')
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-else:
-    # vanilla, non-DDP run
-    ddp_rank = 0
-    ddp_local_rank = 0
-    ddp_world_size = 1
-    master_process = True
-    # attempt to autodetect device
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
-    print(f"using device: {device}")
-
-# added after video, pytorch can be serious about it's device vs. device_type distinction
-device_type = "cuda" if device.startswith("cuda") else "cpu"
-
-torch.manual_seed(1337)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(1337)
-
-enc = tiktoken.get_encoding("gpt2")
-
-total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens, esto viene 64 * 1024 * 8 GPUS
-B = 16 # micro batch size
-T = 256 # sequence length
-assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
-# Aplicamos gradient accumulation por que no podemos hacer un batch de 524288 tokens
-grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
-if master_process:
-    print(f"total desired batch size: {total_batch_size}")
-    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
-
-
-# Paralelización de datos
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
-
-torch.set_float32_matmul_precision('high')
-
-# Funcion que actuaiza el bias en cada capa MoE del modelo
-def update_moe_layer_bias(moe_layer, gamma):
-    # Sumar los tokens asignados a cada experto en esta capa
-    tokens_per_expert = moe_layer.total_assigment_count.float().to(device)
+if __name__ == "__main__":
     
-    # Recogemos los tokens de todos los expertos
-    if dist.is_initialized():
-        dist.all_reduce(tokens_per_expert, op=dist.ReduceOp.AVG)
-    
-    # Promedio local de tokens para este MoE layer
-    avg_tokens = tokens_per_expert.mean()
-    
-    # Definir umbrales locales
-    overload_threshold = avg_tokens * 1.2
-    underload_threshold = avg_tokens * 0.8
+    # simple launch:
+    # python train_gpt2.py
+    # DDP launch for e.g. 8 GPUs:
+    # torchrun --standalone --nproc_per_node=8 train_gpt2.py
 
-    # Determinar índices de expertos sobrecargados e infracargados
-    overloaded = (tokens_per_expert > overload_threshold).nonzero(as_tuple=True)[0]
-    underloaded = (tokens_per_expert < underload_threshold).nonzero(as_tuple=True)[0]
-    
-    with torch.no_grad():
-        if overloaded.numel() > 0:
-            moe_layer.bias[overloaded] -= gamma
-        if underloaded.numel() > 0:
-            moe_layer.bias[underloaded] += gamma
+    # run the training loop
+    from torch.distributed import init_process_group, destroy_process_group
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    import torch.distributed as dist
 
-
-def get_auxiliary_losses():
-    importance_loss = []
-    load_loss = []
-    for block in model.module.transformer.h:
-        
-        if hasattr(block, 'moe_layer') and hasattr(block.moe_layer, 'importance_loss'):
-            importance_loss.append(block.moe_layer.importance_loss.item())
-            load_loss.append(block.moe_layer.load_loss.item())
-        
-        return torch.tensor(importance_loss).mean().item(), torch.tensor(load_loss).mean().item()
-            
-
-# create model
-model = GPT(GPTConfig(vocab_size=50304))
-# model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
-model.to(device)
-use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
-if use_compile:
-    model = torch.compile(model)
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
-raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
-
-max_lr = 6e-4
-min_lr = max_lr * 0.1
-warmup_steps = 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
-
-gamma = 0.001 # Hiperparametro para el ajuste del bias del Gate de MoE
-bias_update_step = int(max_steps * 0.97) # Más o menos en DeepSeek el bias de Gating de MoE pasa a ser 0 a partir de este punto
-
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_steps:
-        return max_lr * (it+1) / warmup_steps
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > max_steps:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
-    return min_lr + coeff * (max_lr - min_lr)
-
-# optimize!
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
-
-# create the log directory we will write checkpoints to and log to
-log_dir = "log"
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"log.txt")
-with open(log_file, "w") as f: # open for writing to clear the file
-    pass
-
-# Monitorización energia de las GPUs
-monitor = ZeusMonitor(gpu_indices=[torch.cuda.current_device()])
-steps = []
-
-monitor.begin_window("epoch")
-for step in range(max_steps):
-    t0 = time.time()
-    last_step = (step == max_steps - 1)
-
-    monitor.begin_window("step")
-    
-    # once in a while evaluate our validation loss
-    if step % 250 == 0 or last_step:
-        model.eval()
-        val_loader.reset()
-        with torch.no_grad():
-            val_loss_accum = 0.0
-            val_loss_steps = 20
-            for _ in range(val_loss_steps):
-                x, y = val_loader.next_batch()
-                x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
-                loss = loss / val_loss_steps
-                val_loss_accum += loss.detach()
-        if ddp:
-            # Aqui se promedian los losses calculados entre las GPUs
-            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-        if master_process:
-            print(f"validation loss: {val_loss_accum.item():.4f}")
-            with open(log_file, "a") as f:
-                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-            if step > 0 and (step % 5000 == 0 or last_step):
-                # optionally write model checkpoints
-                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'config': raw_model.config,
-                    'step': step,
-                    'val_loss': val_loss_accum.item()
-                }
-                # you might also want to add optimizer.state_dict() and
-                # rng seeds etc., if you wanted to more exactly resume training
-                torch.save(checkpoint, checkpoint_path)
-
-    # once in a while evaluate hellaswag
-    if (step % 250 == 0 or last_step) and (not use_compile):
-        num_correct_norm = 0
-        num_total = 0
-        for i, example in enumerate(iterate_examples("val")):
-            # only process examples where i % ddp_world_size == ddp_rank
-            if i % ddp_world_size != ddp_rank:
-                continue
-            # render the example into tokens and labels
-            _, tokens, mask, label = render_example(example)
-            tokens = tokens.to(device)
-            mask = mask.to(device)
-            # get the logits
-            with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(tokens)
-                pred_norm = get_most_likely_row(tokens, mask, logits)
-            num_total += 1
-            num_correct_norm += int(pred_norm == label)
-        # reduce the stats across all processes
-        if ddp:
-            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
-            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
-            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
-            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
-            num_total = num_total.item()
-            num_correct_norm = num_correct_norm.item()
-        acc_norm = num_correct_norm / num_total
-        if master_process:
-            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
-            with open(log_file, "a") as f:
-                f.write(f"{step} hella {acc_norm:.4f}\n")
-
-    # once in a while generate from the model (except step 0, which is noise)
-    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
-        model.eval()
-        num_return_sequences = 4
-        max_length = 32
-        tokens = enc.encode("Hello, I'm a language model,")
-        tokens = torch.tensor(tokens, dtype=torch.long)
-        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-        xgen = tokens.to(device)
-        sample_rng = torch.Generator(device=device)
-        sample_rng.manual_seed(42 + ddp_rank)
-        while xgen.size(1) < max_length:
-            # forward the model to get the logits
-            with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(xgen) # (B, T, vocab_size)
-                # take the logits at the last position
-                logits = logits[:, -1, :] # (B, vocab_size)
-                # get the probabilities
-                probs = F.softmax(logits, dim=-1)
-                # do top-k sampling of 50 (huggingface pipeline default)
-                # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-                # select a token from the top-k probabilities
-                # note: multinomial does not demand the input to sum to 1
-                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
-                # gather the corresponding indices
-                xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-                # append to the sequence
-                xgen = torch.cat((xgen, xcol), dim=1)
-        # print the generated text
-        for i in range(num_return_sequences):
-            tokens = xgen[i, :max_length].tolist()
-            decoded = enc.decode(tokens)
-            print(f"rank {ddp_rank} sample {i}: {decoded}")
-
-    # do one step of the optimization
-    model.train()
-    optimizer.zero_grad()
-    
-    # Actualización de bias para MoE
-    if step == bias_update_step:
-        gamma = 0.0
-        if master_process:
-            print("Zeroed out the bias update speed in the MoE layer -> 97% of training done")
-            
-    if gamma > 0:
-        
-        for block in model.module.transformer.h: 
-            if hasattr(block, 'moe_layer'): 
-                update_moe_layer_bias(block.moe_layer, gamma)
-    #--------------------------------           
-    
-    # Expert assigment count
-    # first_assigment_counts = []
-    total_assigment_count = []
-    # Promedio de conteo de asignaciones a expertos en todas los bloques transformer
-    # fist_assigment_mean = None
-    # Recogemos los conteos de asignaciones a expertos de todas las capas MoE 
-    for block in model.module.transformer.h:
-        
-        if hasattr(block, 'moe_layer') and hasattr(block.moe_layer, 'total_assigment_count'):
-            # first_assigment_counts.append(block.moe_layer.first_expert_assigment_count)
-            total_assigment_count.append(block.moe_layer.total_assigment_count)
-            
-    if total_assigment_count:
-        # Stack: obtiene un tensor de forma (n_layer, n_experts)
-        # 2 tensores: uno para la asignación del primer experto y otro para la asignación a la primera y segunda opción
-        # first_assigment_counts_stack = torch.stack(first_assigment_counts, dim=0)
-        total_assigment_count_stack = torch.stack(total_assigment_count, dim=0)
-        # Promedio a lo largo de los bloques transformer (dim=0)
-        # fist_assigment_mean = first_assigment_counts_stack.float().mean(dim=0)
-        total_mean = total_assigment_count_stack.float().mean(dim=0)
-                
-    if total_assigment_count is not None:
-        if ddp:
-            # Se promedian los tokens recibidos por los expertos entre las GPUs
-            # dist.all_reduce(fist_assigment_mean, op=dist.ReduceOp.AVG)
-            dist.all_reduce(total_mean, op=dist.ReduceOp.AVG)
-            total_tokens = B * T * 2 # Expertos activados = 2
-            # total_assigment = total_mean.sum()
-            # dropped_tokens = total_tokens - total_assigment
-            assigment_percentage = total_mean / float(total_tokens)
-            # first_assignment_percentage = fist_assigment_mean.float() / float(total_tokens)
-            # dropped_percentage = float(dropped_tokens) / total_tokens
-    # -----------------------
-    importance_loss, load_loss = get_auxiliary_losses()
-            
-    loss_accum = 0.0
-    for micro_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        # added after video, this field is also used by the forward pass.
-        if ddp:
-            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        # we have to scale the loss to account for gradient accumulation,
-        # because the gradients just add on each successive backward().
-        # addition of gradients corresponds to a SUM in the objective, but
-        # instead of a SUM we want MEAN. Scale the loss here so it comes out right
-        loss = loss / grad_accum_steps
-        loss_accum += loss.detach()
-        loss.backward()
+    # set up DDP (distributed data parallel).
+    # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+    ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
     if ddp:
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    # determine and set the learning rate for this iteration
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    optimizer.step()
-    if device_type == "cuda":
-        torch.cuda.synchronize() # wait for the GPU to finish work
-        
-    result = monitor.end_window("step")
-    steps.append(result)
-    
-    t1 = time.time()
-    dt = t1 - t0 # time difference in seconds
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
-    tokens_per_sec = tokens_processed / dt
+        # use of DDP atm demands CUDA, we set the device appropriately according to rank
+        assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+        init_process_group(backend='nccl')
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        device = f'cuda:{ddp_local_rank}'
+        torch.cuda.set_device(device)
+        master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+    else:
+        # vanilla, non-DDP run
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        master_process = True
+        # attempt to autodetect device
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "mps"
+        print(f"using device: {device}")
+
+    # added after video, pytorch can be serious about it's device vs. device_type distinction
+    device_type = "cuda" if device.startswith("cuda") else "cpu"
+
+    torch.manual_seed(1337)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(1337)
+
+    enc = tiktoken.get_encoding("gpt2")
+
+    total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens, esto viene 64 * 1024 * 8 GPUS
+    B = 16 # micro batch size
+    T = 256 # sequence length
+    assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+    # Aplicamos gradient accumulation por que no podemos hacer un batch de 524288 tokens
+    grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
     if master_process:
-        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-        with open(log_file, "a") as f:
-            # f.write(f"{step} train {loss_accum.item():.6f}, first expert assigment percentage: {first_assignment_percentage.tolist()}, dropped tokens: {dropped_tokens} ({dropped_percentage * 100:.2f}%)\n")
-            f.write(f"{step} train {loss_accum.item():.6f}, importance loss {importance_loss:.6f}, load loss {load_loss:.6f} expert assigment percentage: {assigment_percentage.tolist()}\n")
+        print(f"total desired batch size: {total_batch_size}")
+        print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-mes = monitor.end_window("epoch")
 
-avg_time = sum(map(lambda m: m.time, steps)) / len(steps)
-avg_energy = sum(map(lambda m: m.total_energy, steps)) / len(steps)
-with open(log_file, "a") as f:
-    f.write(f"Epoch consumed {mes.time} s and {mes.total_energy} J.")
-    f.write(f"One step took {avg_energy} J on average.")
+    # Paralelización de datos
+    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+    val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
-if ddp:
-    destroy_process_group()
+    torch.set_float32_matmul_precision('high')
+
+    # Funcion que actuaiza el bias en cada capa MoE del modelo
+    # def update_moe_layer_bias(moe_layer, gamma):
+    #     # Sumar los tokens asignados a cada experto en esta capa
+    #     tokens_per_expert = moe_layer.total_assigment_count.float().to(device)
+        
+    #     # Recogemos los tokens de todos los expertos
+    #     if dist.is_initialized():
+    #         dist.all_reduce(tokens_per_expert, op=dist.ReduceOp.AVG)
+        
+    #     # Promedio local de tokens para este MoE layer
+    #     avg_tokens = tokens_per_expert.mean()
+        
+    #     # Definir umbrales locales
+    #     overload_threshold = avg_tokens * 1.2
+    #     underload_threshold = avg_tokens * 0.8
+
+    #     # Determinar índices de expertos sobrecargados e infracargados
+    #     overloaded = (tokens_per_expert > overload_threshold).nonzero(as_tuple=True)[0]
+    #     underloaded = (tokens_per_expert < underload_threshold).nonzero(as_tuple=True)[0]
+        
+    #     with torch.no_grad():
+    #         if overloaded.numel() > 0:
+    #             moe_layer.bias[overloaded] -= gamma
+    #         if underloaded.numel() > 0:
+    #             moe_layer.bias[underloaded] += gamma
+
+
+    def get_auxiliary_losses():
+        importance_loss = []
+        load_loss = []
+        for block in model.module.transformer.h:
+            
+            if hasattr(block, 'moe_layer') and hasattr(block.moe_layer, 'importance_loss'):
+                importance_loss.append(block.moe_layer.importance_loss.item())
+                load_loss.append(block.moe_layer.load_loss.item())
+            
+            return torch.tensor(importance_loss).mean().item(), torch.tensor(load_loss).mean().item()            
+
+    # create model
+    model = GPT(GPTConfig(vocab_size=50304))
+    # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
+    model.to(device)
+    use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+    if use_compile:
+        model = torch.compile(model)
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
+    raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
+
+    max_lr = 6e-4
+    min_lr = max_lr * 0.1
+    warmup_steps = 715
+    max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+
+    # gamma = 0.001 # Hiperparametro para el ajuste del bias del Gate de MoE
+    # bias_update_step = int(max_steps * 0.97) # Más o menos en DeepSeek el bias de Gating de MoE pasa a ser 0 a partir de este punto
+
+    def get_lr(it):
+        # 1) linear warmup for warmup_iters steps
+        if it < warmup_steps:
+            return max_lr * (it+1) / warmup_steps
+        # 2) if it > lr_decay_iters, return min learning rate
+        if it > max_steps:
+            return min_lr
+        # 3) in between, use cosine decay down to min learning rate
+        decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+        return min_lr + coeff * (max_lr - min_lr)
+
+    # optimize!
+    optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+
+    # create the log directory we will write checkpoints to and log to
+    log_dir = "log"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"log.txt")
+    with open(log_file, "w") as f: # open for writing to clear the file
+        pass
+
+    # Monitorización energia de las GPUs
+    monitor = ZeusMonitor(gpu_indices=[torch.cuda.current_device()])
+    steps = []
+
+    monitor.begin_window("epoch")
+    for step in range(max_steps):
+        t0 = time.time()
+        last_step = (step == max_steps - 1)
+
+        monitor.begin_window("step")
+        
+        # once in a while evaluate our validation loss
+        if step % 250 == 0 or last_step:
+            model.eval()
+            val_loader.reset()
+            with torch.no_grad():
+                val_loss_accum = 0.0
+                val_loss_steps = 20
+                for _ in range(val_loss_steps):
+                    x, y = val_loader.next_batch()
+                    x, y = x.to(device), y.to(device)
+                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                        logits, loss = model(x, y)
+                    loss = loss / val_loss_steps
+                    val_loss_accum += loss.detach()
+            if ddp:
+                # Aqui se promedian los losses calculados entre las GPUs
+                dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+            if master_process:
+                print(f"validation loss: {val_loss_accum.item():.4f}")
+                with open(log_file, "a") as f:
+                    f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+                if step > 0 and (step % 5000 == 0 or last_step):
+                    # optionally write model checkpoints
+                    checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                    checkpoint = {
+                        'model': raw_model.state_dict(),
+                        'config': raw_model.config,
+                        'step': step,
+                        'val_loss': val_loss_accum.item()
+                    }
+                    # you might also want to add optimizer.state_dict() and
+                    # rng seeds etc., if you wanted to more exactly resume training
+                    torch.save(checkpoint, checkpoint_path)
+
+        # once in a while evaluate hellaswag
+        if (step % 250 == 0 or last_step) and (not use_compile):
+            num_correct_norm = 0
+            num_total = 0
+            for i, example in enumerate(iterate_examples("val")):
+                # only process examples where i % ddp_world_size == ddp_rank
+                if i % ddp_world_size != ddp_rank:
+                    continue
+                # render the example into tokens and labels
+                _, tokens, mask, label = render_example(example)
+                tokens = tokens.to(device)
+                mask = mask.to(device)
+                # get the logits
+                with torch.no_grad():
+                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                        logits, loss = model(tokens)
+                    pred_norm = get_most_likely_row(tokens, mask, logits)
+                num_total += 1
+                num_correct_norm += int(pred_norm == label)
+            # reduce the stats across all processes
+            if ddp:
+                num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+                num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+                dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+                dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+                num_total = num_total.item()
+                num_correct_norm = num_correct_norm.item()
+            acc_norm = num_correct_norm / num_total
+            if master_process:
+                print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+                with open(log_file, "a") as f:
+                    f.write(f"{step} hella {acc_norm:.4f}\n")
+
+        # once in a while generate from the model (except step 0, which is noise)
+        if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
+            model.eval()
+            num_return_sequences = 4
+            max_length = 32
+            tokens = enc.encode("Hello, I'm a language model,")
+            tokens = torch.tensor(tokens, dtype=torch.long)
+            tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+            xgen = tokens.to(device)
+            sample_rng = torch.Generator(device=device)
+            sample_rng.manual_seed(42 + ddp_rank)
+            while xgen.size(1) < max_length:
+                # forward the model to get the logits
+                with torch.no_grad():
+                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                        logits, loss = model(xgen) # (B, T, vocab_size)
+                    # take the logits at the last position
+                    logits = logits[:, -1, :] # (B, vocab_size)
+                    # get the probabilities
+                    probs = F.softmax(logits, dim=-1)
+                    # do top-k sampling of 50 (huggingface pipeline default)
+                    # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+                    topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                    # select a token from the top-k probabilities
+                    # note: multinomial does not demand the input to sum to 1
+                    ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+                    # gather the corresponding indices
+                    xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+                    # append to the sequence
+                    xgen = torch.cat((xgen, xcol), dim=1)
+            # print the generated text
+            for i in range(num_return_sequences):
+                tokens = xgen[i, :max_length].tolist()
+                decoded = enc.decode(tokens)
+                print(f"rank {ddp_rank} sample {i}: {decoded}")
+
+        # do one step of the optimization
+        model.train()
+        optimizer.zero_grad()
+        
+        # Actualización de bias para MoE
+        # if step == bias_update_step:
+        #     gamma = 0.0
+        #     if master_process:
+        #         print("Zeroed out the bias update speed in the MoE layer -> 97% of training done")
+                
+        # if gamma > 0:
+            
+        #     for block in model.module.transformer.h: 
+        #         if hasattr(block, 'moe_layer'): 
+        #             update_moe_layer_bias(dist, device, block.moe_layer, gamma)
+        #--------------------------------           
+        
+        # Expert assigment count
+        # first_assigment_counts = []
+        total_assigment_count = []
+        # Promedio de conteo de asignaciones a expertos en todas los bloques transformer
+        # fist_assigment_mean = None
+        # Recogemos los conteos de asignaciones a expertos de todas las capas MoE 
+        for block in model.module.transformer.h:
+            
+            if hasattr(block, 'moe_layer') and hasattr(block.moe_layer, 'total_assigment_count'):
+                # first_assigment_counts.append(block.moe_layer.first_expert_assigment_count)
+                total_assigment_count.append(block.moe_layer.total_assigment_count)
+                
+        if total_assigment_count:
+            # Stack: obtiene un tensor de forma (n_layer, n_experts)
+            # 2 tensores: uno para la asignación del primer experto y otro para la asignación a la primera y segunda opción
+            # first_assigment_counts_stack = torch.stack(first_assigment_counts, dim=0)
+            total_assigment_count_stack = torch.stack(total_assigment_count, dim=0)
+            # Promedio a lo largo de los bloques transformer (dim=0)
+            # fist_assigment_mean = first_assigment_counts_stack.float().mean(dim=0)
+            total_mean = total_assigment_count_stack.float().mean(dim=0)
+                    
+        if total_assigment_count is not None:
+            if ddp:
+                # Se promedian los tokens recibidos por los expertos entre las GPUs
+                # dist.all_reduce(fist_assigment_mean, op=dist.ReduceOp.AVG)
+                dist.all_reduce(total_mean, op=dist.ReduceOp.AVG)
+                total_tokens = B * T * 2 # Expertos activados = 2
+                # total_assigment = total_mean.sum()
+                # dropped_tokens = total_tokens - total_assigment
+                assigment_percentage = total_mean / float(total_tokens)
+                # first_assignment_percentage = fist_assigment_mean.float() / float(total_tokens)
+                # dropped_percentage = float(dropped_tokens) / total_tokens
+        # -----------------------
+        importance_loss, load_loss = get_auxiliary_losses()
+                
+        loss_accum = 0.0
+        for micro_step in range(grad_accum_steps):
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+            # added after video, this field is also used by the forward pass.
+            if ddp:
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+            # we have to scale the loss to account for gradient accumulation,
+            # because the gradients just add on each successive backward().
+            # addition of gradients corresponds to a SUM in the objective, but
+            # instead of a SUM we want MEAN. Scale the loss here so it comes out right
+            loss = loss / grad_accum_steps
+            loss_accum += loss.detach()
+            loss.backward()
+        if ddp:
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # determine and set the learning rate for this iteration
+        lr = get_lr(step)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        optimizer.step()
+        if device_type == "cuda":
+            torch.cuda.synchronize() # wait for the GPU to finish work
+            
+        result = monitor.end_window("step")
+        steps.append(result)
+        
+        t1 = time.time()
+        dt = t1 - t0 # time difference in seconds
+        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+        tokens_per_sec = tokens_processed / dt
+        if master_process:
+            print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+            with open(log_file, "a") as f:
+                # f.write(f"{step} train {loss_accum.item():.6f}, first expert assigment percentage: {first_assignment_percentage.tolist()}, dropped tokens: {dropped_tokens} ({dropped_percentage * 100:.2f}%)\n")
+                f.write(f"{step} train {loss_accum.item():.6f}, importance loss {importance_loss:.6f}, load loss {load_loss:.6f} expert assigment percentage: {assigment_percentage.tolist()}\n")
+
+    mes = monitor.end_window("epoch")
+
+    avg_time = sum(map(lambda m: m.time, steps)) / len(steps)
+    avg_energy = sum(map(lambda m: m.total_energy, steps)) / len(steps)
+    with open(log_file, "a") as f:
+        f.write(f"Epoch consumed {mes.time} s and {mes.total_energy} J.")
+        f.write(f"One step took {avg_energy} J on average.")
+
+    if ddp:
+        destroy_process_group()

@@ -55,138 +55,8 @@ class FFN(nn.Module):
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
-        return x
-    
-    
-class SwitchMoE(nn.Module):
-    
-    def __init__(self, config):
-        super().__init__()
-        self.router = nn.Linear(config.n_embd, config.n_experts, bias=False)
-        self.expert_capacity = config.expert_capacity
-        self.experts = nn.ModuleList([FFN(config) for _ in range(config.n_experts)])
-        self.n_experts = config.n_experts
-        
-        self.w_load = config.w_load
-        self.lambda_z = config.lambda_z
-        
-        
-    def get_z_loss(self, router_logits):
-        _, tokens, _ = router_logits.shape
-        log_z = torch.logsumexp(router_logits, dim=-1)
-        z_loss = log_z**2
-        return torch.sum(z_loss) / tokens
-        
-        
-    def get_load_balance_loss(self, router_probs, expert_onehot):
-        
-        """
-        router_probs: Tensor que representa la probabilidad de que un token sea enviado a cada experto -> dimension (B, T, n_experts)
-        expert_onehot: Tensor que representa el experto seleccionado para cada token -> dimension (B, T, n_experts)
-        """
-        
-        expert_onehot = expert_onehot.reshape(-1, self.n_experts)
-        router_probs = router_probs.reshape(-1, self.n_experts)
-        
-        # Tensor que representa la fraccion de los tokens enviados a cada experto -> dimension (n_experts, 1)
-        f_i = expert_onehot.float().mean(dim=0)
-        # NOTA: la suma de las fracciones entre los expertos no tiene por qué ser 1, porque hay tokens que no se envían a ningún experto -> Dropped Tokens
-        
-        # Representa la probabilidad total de que un token sea enviado a cada experto -> dimension (n_experts, 1)
-        P_i = router_probs.mean(dim=0)
+        return x  
 
-        return self.w_load * self.n_experts * torch.sum(f_i * P_i)
-        
-        
-    def route(self, x):
-        
-        B, T, C = x.shape
-        
-        x_flat = x.view(B*T, C)
-        
-        router_logits = self.router(x_flat)
-        
-        z_loss = self.get_z_loss(router_logits.unsqueeze(0)) * self.lambda_z
-        
-        router_probs = F.softmax(
-            router_logits,
-            dim=-1,
-            dtype=torch.float,
-        ).type_as(x)
-        
-        top2_experts = torch.topk(router_probs, 2, dim=-1)
-        first_choice = top2_experts.indices[:, 0]
-        second_choice = top2_experts.indices[:, 1]
-        
-        # Tensores onehot para los expertos seleccionados, tanto primera opcion como segunda
-        first_expert_index = F.one_hot(first_choice, num_classes=self.n_experts)
-        second_expert_index = F.one_hot(second_choice, num_classes=self.n_experts)
-        
-        # Mascara para la capacidad de los expertos
-        token_priority = torch.cumsum(first_expert_index, dim=0)
-        expert_capacity_mask = token_priority <= self.expert_capacity
-
-        # Intentamos asignar primero a first_expert
-        assigned_first = first_expert_index * expert_capacity_mask
-        dropped_tokens = (assigned_first.sum(dim=-1) == 0)  # Tokens no asignados
-
-        # Ahora intentamos asignar los `dropped_tokens` al segundo experto
-        token_priority_second = torch.cumsum(second_expert_index, dim=0)
-        expert_capacity_mask_second = token_priority_second <= self.expert_capacity
-        assigned_second = second_expert_index * expert_capacity_mask_second * dropped_tokens.unsqueeze(-1)
-
-        # Combinar asignaciones: tokens que no entraron en el primero intentan entrar en el segundo
-        expert_index = assigned_first + assigned_second
-        
-        self.first_expert_assigment_count = assigned_first.sum(dim=0)
-        self.total_assigment_count = expert_index.sum(dim=0)
-
-        # Pérdidas auxiliares
-        load_balance_loss = self.get_load_balance_loss(router_probs, expert_index)
-        router_probs = torch.max(router_probs, dim=-1).values.unsqueeze(-1)
-
-        return expert_index, router_probs, load_balance_loss + z_loss, x_flat, B, T
-         
-    def forward(self, x):
-        
-        expert_index, router_probs, auxiliary_loss, x_flat, B, T = self.route(x)
-        
-        # Indices de los expertos seleccionados
-        # expert_index = torch.argmax(router_mask, dim=-1)
-        
-        # Clonamos las entradas porque hay tokens que no se procesarán -> Dropped tokens
-        next_states = x_flat.clone()
-        
-        for idx in range(self.n_experts):
-            
-            expert_mask = expert_index[:, idx].bool()
-            if expert_mask.sum() > 0:
-                next_states[expert_mask] = self.experts[idx](x_flat[expert_mask]).type_as(x)
-                
-        next_states = next_states.view(B, T, -1)
-        router_probs = router_probs.view(B, T, 1)
-            
-        # La salida se multiplica por la probabilidad de cada experto
-        # Duda: tiene sentido multiplicar por la probabilidad de cada experto si hay tokens que no se envían a ningún experto?
-        x = router_probs * next_states
-        
-        return x, auxiliary_loss  
-  
-  
-class MixtralMoE(nn.Module):
-    
-    def __init__(self, config):
-        super().__init__()
-        self.router = nn.Linear(config.n_embd, config.n_experts, bias=False)
-        self.expert_capacity = config.expert_capacity
-        self.experts = nn.ModuleList([FFN(config) for _ in range(config.n_experts)])
-        self.n_experts = config.n_experts
-        
-        self.w_load = config.w_load
-        self.lambda_z = config.lambda_z
-        
-    def forward():
-        return
     
 # num decayed parameter tensors: 146, with 294,297,600 parameters
 # num non-decayed parameter tensors: 170, with 259,584 parameters
@@ -196,19 +66,22 @@ class MoE(nn.Module):
         super().__init__()
         self.n_experts = config.n_experts
         assert self.n_experts > 0
-        self.experts = nn.ModuleList([FFN(config) for _ in range(config.n_experts)])
-        self.gate = nn.Linear(config.n_embd, config.n_experts, bias=False)
-        self.noise_layer = nn.Linear(config.n_embd, config.n_experts, bias=False)
+        self.experts = nn.ModuleList([FFN(config) for _ in range(self.n_experts)])
+        self.gate = nn.Linear(config.n_embd, self.n_experts, bias=False)
+        self.noise_layer = nn.Linear(config.n_embd, self.n_experts, bias=False)
         
         self.n_experts_per_tok = config.n_experts_per_tok
         # Peso para la importancia de los expertos
         self.w_importance = config.w_importance
         # Peso para la carga de los expertos, hacer que reciban nº similar de tokens
         self.w_load = config.w_load
+        # Peso para la penalización de logits grandes
+        self.lambda_z = config.lambda_z
+        
         self.importance_loss = 0.0
         self.load_loss = 0.0
-        self.lambda_z = config.lambda_z
-
+        self.z_loss = 0.0
+        
         # self.bias = nn.Parameter(torch.empty(self.n_experts))
         
     
@@ -653,30 +526,30 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision('high')
 
     # Funcion que actuaiza el bias en cada capa MoE del modelo
-    # def update_moe_layer_bias(moe_layer, gamma):
-    #     # Sumar los tokens asignados a cada experto en esta capa
-    #     tokens_per_expert = moe_layer.total_assigment_count.float().to(device)
+    def update_moe_layer_bias(moe_layer, gamma):
+        # Sumar los tokens asignados a cada experto en esta capa
+        tokens_per_expert = moe_layer.total_assigment_count.float().to(device)
         
-    #     # Recogemos los tokens de todos los expertos
-    #     if dist.is_initialized():
-    #         dist.all_reduce(tokens_per_expert, op=dist.ReduceOp.AVG)
+        # Recogemos los tokens de todos los expertos
+        if dist.is_initialized():
+            dist.all_reduce(tokens_per_expert, op=dist.ReduceOp.AVG)
         
-    #     # Promedio local de tokens para este MoE layer
-    #     avg_tokens = tokens_per_expert.mean()
+        # Promedio local de tokens para este MoE layer
+        avg_tokens = tokens_per_expert.mean()
         
-    #     # Definir umbrales locales
-    #     overload_threshold = avg_tokens * 1.2
-    #     underload_threshold = avg_tokens * 0.8
+        # Definir umbrales locales
+        overload_threshold = avg_tokens * 1.2
+        underload_threshold = avg_tokens * 0.8
 
-    #     # Determinar índices de expertos sobrecargados e infracargados
-    #     overloaded = (tokens_per_expert > overload_threshold).nonzero(as_tuple=True)[0]
-    #     underloaded = (tokens_per_expert < underload_threshold).nonzero(as_tuple=True)[0]
+        # Determinar índices de expertos sobrecargados e infracargados
+        overloaded = (tokens_per_expert > overload_threshold).nonzero(as_tuple=True)[0]
+        underloaded = (tokens_per_expert < underload_threshold).nonzero(as_tuple=True)[0]
         
-    #     with torch.no_grad():
-    #         if overloaded.numel() > 0:
-    #             moe_layer.bias[overloaded] -= gamma
-    #         if underloaded.numel() > 0:
-    #             moe_layer.bias[underloaded] += gamma
+        with torch.no_grad():
+            if overloaded.numel() > 0:
+                moe_layer.bias[overloaded] -= gamma
+            if underloaded.numel() > 0:
+                moe_layer.bias[underloaded] += gamma
 
 
     def get_auxiliary_losses():

@@ -187,7 +187,7 @@ class MoE(nn.Module):
             dtype=torch.float,
         ).type_as(x)    
         
-        self.importance_loss = self.get_auxiliary_loss(weights, selected_experts)
+        # self.importance_loss = self.get_auxiliary_loss(weights, selected_experts)
         
         self.total_assigment_count = torch.zeros(self.n_experts, device=x.device, dtype=torch.int32)
 
@@ -209,7 +209,7 @@ class MoE(nn.Module):
                 # weights[batch_idx, nth_expert, None] contiene las contribuciones del experto i para cada token
                 results[batch_idx] += weights[batch_idx, nth_expert, None] * expert_logits
                         
-        return results.view_as(x), self.importance_loss + self.load_loss
+        return results.view_as(x), self.load_loss
         
 
 class Block(nn.Module):
@@ -553,25 +553,25 @@ if __name__ == "__main__":
 
 
     def get_auxiliary_losses():
-        importance_loss = []
+        # importance_loss = []
         load_loss = []
         for block in model.module.transformer.h:
             
-            if hasattr(block, 'moe_layer') and hasattr(block.moe_layer, 'importance_loss'):
-                importance_loss.append(block.moe_layer.importance_loss.item())
+            if hasattr(block, 'moe_layer') and hasattr(block.moe_layer, 'load_loss'):
+                # importance_loss.append(block.moe_layer.importance_loss.item())
                 load_loss.append(block.moe_layer.load_loss.item())
             
-            return torch.tensor(importance_loss).mean().item(), torch.tensor(load_loss).mean().item()            
+            return None, torch.tensor(load_loss).mean().item()            
 
     # create model
     model = GPT(GPTConfig(vocab_size=50304))
     # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
     model.to(device)
-    use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+    use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
     if use_compile:
         model = torch.compile(model)
     if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=False)
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
     max_lr = 6e-4
@@ -769,7 +769,7 @@ if __name__ == "__main__":
                 # first_assignment_percentage = fist_assigment_mean.float() / float(total_tokens)
                 # dropped_percentage = float(dropped_tokens) / total_tokens
         # -----------------------
-        importance_loss, load_loss = get_auxiliary_losses()
+        _, load_loss = get_auxiliary_losses()
                 
         loss_accum = 0.0
         for micro_step in range(grad_accum_steps):
@@ -809,7 +809,7 @@ if __name__ == "__main__":
             print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
             with open(log_file, "a") as f:
                 # f.write(f"{step} train {loss_accum.item():.6f}, first expert assigment percentage: {first_assignment_percentage.tolist()}, dropped tokens: {dropped_tokens} ({dropped_percentage * 100:.2f}%)\n")
-                f.write(f"{step} train {loss_accum.item():.6f}, importance loss {importance_loss:.6f}, load loss {load_loss:.6f} expert assigment percentage: {assigment_percentage.tolist()}\n")
+                f.write(f"{step} train {loss_accum.item():.6f}, load loss {load_loss:.6f} expert assigment percentage: {assigment_percentage.tolist()}\n")
 
     mes = monitor.end_window("epoch")
 

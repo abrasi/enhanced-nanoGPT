@@ -56,81 +56,336 @@ class FFN(nn.Module):
         x = self.gelu(x)
         x = self.c_proj(x)
         return x  
-
     
-# num decayed parameter tensors: 146, with 294,297,600 parameters
-# num non-decayed parameter tensors: 170, with 259,584 parameters
-class MoE(nn.Module):
-    
+  
+class CondMLP(nn.Module):
+ 
     def __init__(self, config):
         super().__init__()
-        self.n_experts = config.n_experts
-        assert self.n_experts > 0
-        self.experts = nn.ModuleList([FFN(config) for _ in range(self.n_experts)])
-        self.gate = nn.Linear(config.n_embd, self.n_experts, bias=False)
-        self.noise_layer = nn.Linear(config.n_embd, self.n_experts, bias=False)
+        self.guesser = nn.Linear(config.n_embd, config.n_paths)
+        self.c_fc    = nn.Linear(config.n_embd, 4*config.n_embd, bias=False)
+        self.b_fc    = nn.Embedding(config.n_paths, 4*config.n_embd)
+        self.gelu    = nn.GELU(approximate='tanh')
+        self.c_proj  = nn.Linear(4*config.n_embd, config.n_embd, bias=False)
+        self.b_proj  = nn.Embedding(config.n_paths, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
+        self.n_paths = config.n_paths
         
-        self.n_experts_per_tok = config.n_experts_per_tok
-        # Peso para la importancia de los expertos
+        # Bias de DeepSeek
+        self.bias = nn.Parameter(torch.empty(self.n_experts)) if config.bias else None
+        
         self.w_importance = config.w_importance
-        # Peso para la carga de los expertos, hacer que reciban nº similar de tokens
+        # Peso para o loss de balanceo de carga dos expertos
         self.w_load = config.w_load
-        # Peso para la penalización de logits grandes
+        # Peso para o loss de penalización de logits grandes
         self.lambda_z = config.lambda_z
+        # Peso para o loss de Brais
+        self.w_penalty = config.w_penalty
         
         self.importance_loss = 0.0
         self.load_loss = 0.0
         self.z_loss = 0.0
+        self.penalty = 0.0
+ 
+    def __get_penalty(self, prob):
+        penalty_a = torch.mean(prob * (1. - prob))
+        prob_mean = torch.mean(prob, dim=(0, 1))
+        penalty_b = (1. / self.n_paths - torch.mean(prob_mean * (1. - prob_mean)))
+        return penalty_a + penalty_b
+ 
+    def get_z_loss(self, router_logits):
+        logsumexp = torch.logsumexp(router_logits, dim=-1)
+        loss = torch.mean(logsumexp ** 2)
+        return self.lambda_z * loss
+           
+    def get_load_balance_loss(self, prob, selection):
+        B, T, E = prob.shape
+        S = B * T
+
+        # f_i: fracción de tokens cuyo top-1 es el experto i
+        selection_flat = selection.view(-1)  # (S,)
+        f_i = torch.bincount(selection_flat, minlength=E).float() / S  # (E,)
+
+        # P_i: probabilidad media que el router asignó al experto i
+        P_i = prob.view(-1, E).mean(dim=0)
         
-        # self.bias = nn.Parameter(torch.empty(self.n_experts))
+        return self.w_load * E * torch.sum(f_i * P_i)
+ 
+    def get_importance_loss(self, probs, selection):
+
+        B, T, E = probs.shape
+        S = B * T
+
+        probs_flat = probs.view(S, E)
+        selection_flat = selection.view(S, 1)
+        weights = torch.gather(probs_flat, 1, selection_flat)
+
+        # Construir tensor disperso G: (S, E) con ceros salvo en el experto top-1
+        G = torch.zeros_like(probs_flat)
+        G.scatter_(1, selection_flat, weights)
+
+        importance = G.sum(dim=0)
+        mean = importance.mean()
+        var = importance.var(unbiased=False)
+        cv_squared = var / (mean ** 2)
+
+        return self.w_importance * cv_squared
+ 
+    def __get_selection(self, prob):
+        B, T, _ = prob.size()
+        selection = torch.multinomial(prob.view(B*T, -1), 1).view(B, T)
+        # r = torch.rand_like(guess)
+        # g = guess + .1 * (torch.log(r) - torch.log(1. - r))
+        # selection = torch.argmax(g, dim=2)
+        return selection
+
+    def forward(self, x):
+        guess = self.guesser(x)
         
+        if self.bias is not None:
+            guess += self.bias
+        
+        if self.lambda_z > 0:
+            self.z_loss = self.get_z_loss(guess)
+        
+        prob = torch.softmax(guess / 1.66, dim=-1)
+        selection = self.__get_selection(prob)
+        
+        if self.w_load > 0:
+            self.load_loss = self.get_load_balance_loss(prob, selection)
+        
+        x2 = self.c_fc(x) + self.b_fc(selection)
+        x2 = self.gelu(x2)
+        x2 = self.c_proj(x2) + self.b_proj(selection)
+        self.penalty = self.__get_penalty(prob)
+        return x2 + x, self.penalty
+     
     
-    # load_loss asegura que todos los expertos reciben ejemplos.
-    # auxiliary_loss asegura que todos los expertos son útiles y no quedan expertos inactivos.
-    def get_kth_excluding(self, gate_logits):
+class GShardMoE(nn.Module):
+    
+    def __init__(self, config):
+        super().__init__()
+        
+        # Número de expertos
+        self.n_experts = config.n_experts
+        assert self.n_experts > 0
+        
+        self.ddp_rank = config.ddp_rank
+        self.ddp_world_size = config.ddp_world_size
+        
+        # Creamos os expertos de forma distribuída
+        self.experts_per_gpu = [i for i in range(self.n_experts) if i % self.ddp_world_size == self.ddp_rank]
+        self.expert_locations = {i: i % self.ddp_world_size for i in range(self.n_experts)}
+        
+        self.experts = nn.ModuleDict({
+            str(i): FFN(config).to(f'cuda:{self.ddp_rank}') for i in self.experts_per_gpu
+        })
+        
+        # Pesos do gate
+        self.gate = nn.Linear(config.n_embd, self.n_experts, bias=False)
+        # Bias de DeepSeek
+        self.bias = nn.Parameter(torch.empty(self.n_experts)) if config.bias else None
+        
+        # Top-k expertos a seleccionar por token
+        self.topk = config.topk
+        # Capacidade dos expertos
+        self.expert_capacity = config.expert_capacity
+        self.experts = nn.ModuleList([FFN(config) for _ in range(self.n_experts)])
+        
+        # Peso para o loss da importancia dos expertos
+        self.w_importance = config.w_importance
+        # Peso para o loss de balanceo de carga dos expertos
+        self.w_load = config.w_load
+        # Peso para o loss de penalización de logits grandes
+        self.lambda_z = config.lambda_z
+        # Peso para o loss de Brais
+        self.w_penalty = config.w_penalty
+        
+        self.importance_loss = 0.0
+        self.load_loss = 0.0
+        self.z_loss = 0.0
+        self.penalty = 0.0
+        
+    def get_load_balance_loss(self, router_probs, expert_onehot):
+        
+        P_i = router_probs.mean(dim=0)
+        f_i = expert_onehot.float().mean(dim=0)
+
+        return self.w_load * self.n_experts * (f_i * P_i).sum()
+    
+    def get_importance_loss(self, G):
+
+        importance = G.sum(dim=0)  # suma por experto → (n_experts,)
+        mean = importance.mean()
+        var = importance.var(unbiased=False)
+        cv_squared = var / (mean ** 2)  # evitar división por 0
+        return self.w_importance * cv_squared
+        
+    def get_z_loss(self, router_logits):
+        logsumexp = torch.logsumexp(router_logits, dim=-1)
+        loss = torch.mean(logsumexp ** 2)
+        return self.lambda_z * loss
+           
+    def get_penalty(self, gate_logits):
+
+        probs = F.softmax(gate_logits / 1.66, dim=-1)
+
+        # Penalty A: castiga scores axustados
+        penalty_a = torch.mean(probs * (1. - probs))
+
+        # Penalty B: favorece equilibro do uso dos camiños
+        prob_mean = probs.mean(dim=0)  # (n_experts,)
+        penalty_b = (1. / self.n_experts - torch.mean(prob_mean * (1. - prob_mean)))
+
+        return penalty_a + penalty_b
+        
+    def forward(self, x):
+        B, T, C = x.shape
+        S = B * T
+        x_squashed = x.view(-1, x.shape[-1])
+        
+        router_logits = self.gate(x_squashed)
+        
+        if self.bias is not None:
+            router_logits += self.bias
+            
+        if self.w_penalty > 0:
+            self.penalty = self.w_penalty * self.get_penalty(router_logits)
+            
+        if self.lambda_z > 0:
+            self.z_loss = self.get_z_loss(router_logits)
+        
+        probs = F.softmax(
+            router_logits,
+            dim=-1,
+            dtype=torch.float,
+        ).type_as(x)
+        
+        weights, selected_experts = torch.topk(probs, k=2, dim=-1)  # (S, 2)
+        g1, g2 = weights[:, 0], weights[:, 1]
+        e1, e2 = selected_experts[:, 0], selected_experts[:, 1]
+        
+        g1_normalized = g1 / (g1 + g2)
+        g2_normalized = g2 / (g1 + g2)
+        
+        # Contar os tokens asignados a cada experto
+        c_e1 = torch.zeros(self.n_experts, dtype=torch.long, device=x.device)
+        c_e2 = torch.zeros(self.n_experts, dtype=torch.long, device=x.device)
+        
+        G = torch.zeros(S, self.n_experts, device=x.device)
+        expert_onehot = torch.zeros_like(G)
+        
+        # Asignación al top-1 (e1)
+        for i in range(S):
+            expert = e1[i].item()
+            if c_e1[expert] < self.expert_capacity:
+                G[i, expert] += g1_normalized[i]
+            expert_onehot[i, expert] = 1
+            c_e1[expert] += 1
+                
+        # Calcular pérdida auxiliar
+        self.load_loss = self.get_load_balance_loss(probs, expert_onehot)
+
+        # Asignación al top-2 (e2), con muestreo estocástico
+        rand_vals = torch.rand(S, device=x.device)
+        for i in range(S):
+            expert = e2[i].item()
+            if c_e2[expert] < self.expert_capacity and 2 * g2_normalized[i] > rand_vals[i]:
+                G[i, expert] += g2_normalized[i]
+            c_e2[expert] += 1
+            
+        if self.w_importance > 0:
+            self.importance_loss = self.get_importance_loss()
+            
+        y_flat = torch.zeros(S, C, device=x.device)
+
+        for e in range(self.n_experts):
+            token_ids = torch.nonzero(G[:, e], as_tuple=False).squeeze(-1)
+            if token_ids.numel() == 0:
+                continue
+
+            tokens = x_squashed[token_ids]
+            weights = G[token_ids, e].unsqueeze(-1)
+            out = self.experts[e](tokens)             
+            out = out * weights                       
+            y_flat[token_ids] += out                  
+
+        y = y_flat.view(B, T, C)
+        
+        return y
+
+        
+class SwitchMoE(nn.Module): 
+    
+    def __init__(self, config):
+        super().__init__()
+        
+        # Número de expertos
+        self.n_experts = config.n_experts
+        assert self.n_experts > 0
+        
+        self.ddp_rank = config.ddp_rank
+        self.ddp_world_size = config.ddp_world_size
+        
+        # Creamos os expertos de forma distribuída
+        self.experts_per_gpu = [i for i in range(self.n_experts) if i % self.ddp_world_size == self.ddp_rank]
+        self.expert_locations = {i: i % self.ddp_world_size for i in range(self.n_experts)}
+        
+        self.experts = nn.ModuleDict({
+            str(i): FFN(config).to(f'cuda:{self.ddp_rank}') for i in self.experts_per_gpu
+        })
+        
+        # Pesos do gate
+        self.gate = nn.Linear(config.n_embd, self.n_experts, bias=False)
+        # Bias de DeepSeek
+        self.bias = nn.Parameter(torch.empty(self.n_experts)) if config.bias else None
+        
+        self.expert_capacity = config.expert_capacity
+        self.experts = nn.ModuleList([FFN(config) for _ in range(self.n_experts)])
+        
+        # Peso para o loss da importancia dos expertos
+        self.w_importance = config.w_importance
+        # Peso para o loss de balanceo de carga dos expertos
+        self.w_load = config.w_load
+        # Peso para o loss de penalización de logits grandes
+        self.lambda_z = config.lambda_z
+        # Peso para o loss de Brais
+        self.w_penalty = config.w_penalty
+        
+        self.importance_loss = 0.0
+        self.load_loss = 0.0
+        self.z_loss = 0.0
+        self.penalty = 0.0
+             
+    def get_z_loss(self, router_logits):
+        
+        logsumexp = torch.logsumexp(router_logits, dim=-1)
+        loss = torch.mean(logsumexp ** 2)
+        return self.lambda_z * loss
+          
+    def get_load_balance_loss(self, router_probs, expert_onehot):
+        
         """
-        Calcula kth_excluding(H(x), k, i) para cada experto i en el gating network.
-
-        gate_logits: [batch*seq_len, n_experts] (logits antes de softmax)
-        k: número de expertos a seleccionar por token
+        router_probs: Tensor que representa la probabilidad de que un token sea enviado a cada experto -> dimension (B, T, n_experts)
+        expert_onehot: Tensor que representa el experto seleccionado para cada token -> dimension (B, T, n_experts)
         """
         
-        # Expandir logits para comparación (agregar una dimensión extra para simular exclusión)
-        expanded_logits = gate_logits.unsqueeze(1).expand(-1, self.n_experts, -1)  # [B*T, n_experts, n_experts]
+        expert_onehot = expert_onehot.reshape(-1, self.n_experts)
+        router_probs = router_probs.reshape(-1, self.n_experts)
+        
+        # Tensor que representa la fraccion de los tokens enviados a cada experto -> dimension (n_experts, 1)
+        f_i = expert_onehot.float().mean(dim=0)
+        # NOTA: la suma de las fracciones entre los expertos no tiene por qué ser 1, porque hay tokens que no se envían a ningún experto -> Dropped Tokens
+        
+        # Representa la probabilidad total de que un token sea enviado a cada experto -> dimension (n_experts, 1)
+        P_i = router_probs.mean(dim=0)
 
-        # Crear una máscara para excluir cada experto i
-        mask = torch.eye(self.n_experts, device=gate_logits.device).bool()  # [n_experts, n_experts]
-        masked_logits = expanded_logits.masked_fill(mask, float('-inf'))  # Reemplazar la diagonal con -inf
-
-        # Obtener el k-ésimo mayor excluyendo cada experto i
-        kth_values, _ = torch.topk(masked_logits, self.n_experts_per_tok, dim=2)  # [B*T, n_experts, k]
-        kth_excluding_values = kth_values[:, :, -1]  # Última columna es el k-ésimo mayor excluyendo i
-
-        return kth_excluding_values
+        return self.w_load * self.n_experts * torch.sum(f_i * P_i)
         
-    
-    # Ensure that each expert receives a similar number of tokens 
-    def get_load_loss(self, gate_logits, noise_std):
-                        
-        kth_excluding = self.get_kth_excluding(gate_logits)
+    def get_importance_loss(self, probs, selected_experts):
         
-        normal_cdf = torch.distributions.Normal(0, 1).cdf
-        P_xi = normal_cdf((gate_logits - kth_excluding) / noise_std)
         
-        Load_X = P_xi.sum(dim=0)
-
-        mean_load = Load_X.mean()
-        std_load = Load_X.std()
-        CV = std_load / mean_load
-        
-        # Compute load balancing loss
-        L_load = self.w_load * (CV ** 2)
-        return L_load       
-        
-    # Importance-based loss
-    def get_auxiliary_loss(self, probs, selected_experts):
-    
-        # Tenemos un tensor probs de forma (B*T, n_experts_per_tok) y necesitamos uno de forma (B*T, n_experts)
+        # Tenemos un tensor probs de forma (B*T, topk) y necesitamos uno de forma (B*T, n_experts)
         B_T, _ = probs.shape
         probs_expanded = torch.zeros(B_T, self.n_experts, device=probs.device, dtype=probs.dtype)
         
@@ -139,11 +394,157 @@ class MoE(nn.Module):
         
         importance = probs_expanded.sum(dim=0)
         
-        cv_squared = torch.var(importance) / torch.mean(importance) ** 2
+        cv_squared = importance.var(unbiased=False) / torch.mean(importance) ** 2
         
         return self.w_importance * cv_squared
     
-    # St-MoE, penaliza logits muy grandes
+    def get_penalty(self, gate_logits):
+
+        probs = F.softmax(gate_logits / 1.66, dim=-1)
+
+        # Penalty A: castiga scores axustados
+        penalty_a = torch.mean(probs * (1. - probs))
+
+        # Penalty B: favorece equilibro do uso dos camiños
+        prob_mean = probs.mean(dim=0)  # (n_experts,)
+        penalty_b = (1. / self.n_experts - torch.mean(prob_mean * (1. - prob_mean)))
+
+        return penalty_a + penalty_b
+    
+    def route(self, x):
+        
+        B, T, C = x.shape
+        
+        x_flat = x.view(B*T, C)
+        
+        router_logits = self.gate(x_flat)
+        
+        # Engadimos o bias de DeepSeek
+        if self.bias is not None:
+            gate_logits += self.bias
+        
+        if self.w_penalty > 0:
+            self.penalty = self.w_penalty * self.get_penalty(router_logits)
+        
+        if self.lambda_z > 0:
+            self.z_loss = self.get_z_loss(router_logits)
+        
+        router_probs = F.softmax(
+            router_logits,
+            dim=-1,
+            dtype=torch.float,
+        ).type_as(x)
+        
+        top1_weight, top1_idx = torch.max(router_probs, dim=-1)
+        
+        # Tensores onehot para os expertos top1 seleccionados
+        top1_expert_mask = F.one_hot(top1_idx, num_classes=self.n_experts)
+        
+        # Mascara para a capacidade dos expertos
+        token_priority = torch.cumsum(top1_expert_mask, dim=0)
+        expert_capacity_mask = token_priority <= self.expert_capacity
+
+        # Intentamos asignar primero a first_expert
+        expert_index = top1_expert_mask * expert_capacity_mask
+        # Rexistramos os tokens que non se asignaron a ningun experto
+        self.dropped_tokens = (expert_index.sum(dim=-1) == 0)
+        
+        self.expert_assigment_count = expert_index.sum(dim=0)
+
+        # Pérdidas auxiliares
+        if self.w_load > 0:
+            # No paper de Switch Transformer non se especifica se o loss calculase coas asignacións REAIS, contando co expert capacity, ou se cos intentos de asignacións do Gate, déixase igual que en GShard
+            self.load_loss = self.get_load_balance_loss(router_probs, top1_expert_mask)
+            
+        if self.w_importance > 0:
+            self.importance_loss = self.get_importance_loss(top1_weight, top1_idx)
+            
+        router_probs = torch.max(router_probs, dim=-1).values.unsqueeze(-1)
+
+        return expert_index, router_probs, self.load_loss + self.z_loss + self.penalty + self.importance_loss, x_flat, B, T
+         
+    def forward(self, x):
+        
+        expert_index, router_probs, auxiliary_loss, x_flat, B, T = self.route(x)
+        
+        # Indices de los expertos seleccionados
+        # expert_index = torch.argmax(router_mask, dim=-1)
+        
+        # Clonamos las entradas porque hay tokens que no se procesarán -> Dropped tokens
+        next_states = x_flat.clone()
+        
+        for idx in range(self.n_experts):
+            
+            expert_mask = expert_index[:, idx].bool()
+            if expert_mask.sum() > 0:
+                next_states[expert_mask] = self.experts[idx](x_flat[expert_mask]).type_as(x)
+                
+        next_states = next_states.view(B, T, -1)
+        router_probs = router_probs.view(B, T, 1)
+            
+        # La salida se multiplica por la probabilidad de cada experto
+        # Duda: tiene sentido multiplicar por la probabilidad de cada experto si hay tokens que no se envían a ningún experto?
+        x = router_probs * next_states
+        
+        return x, auxiliary_loss
+
+
+class OLNNMoE(nn.Module):
+    
+    def __init__(self, config):
+        super().__init__()
+        
+        # Número de expertos
+        self.n_experts = config.n_experts
+        assert self.n_experts > 0
+        
+        self.ddp_rank = config.ddp_rank
+        self.ddp_world_size = config.ddp_world_size
+        
+        # Creamos os expertos de forma distribuída
+        self.experts_per_gpu = [i for i in range(self.n_experts) if i % self.ddp_world_size == self.ddp_rank]
+        self.expert_locations = {i: i % self.ddp_world_size for i in range(self.n_experts)}
+        
+        self.experts = nn.ModuleDict({
+            str(i): FFN(config).to(f'cuda:{self.ddp_rank}') for i in self.experts_per_gpu
+        })
+        
+        
+        # Pesos do gate
+        self.gate = nn.Linear(config.n_embd, self.n_experts, bias=False)
+        # Pesos de ruido gaussiano
+        self.noise_layer = nn.Linear(config.n_embd, self.n_experts, bias=False)
+        # Bias de DeepSeek
+        self.bias = nn.Parameter(torch.empty(self.n_experts)) if config.bias else None
+        
+        # Top-k expertos a seleccionar por token
+        self.topk = config.topk
+        
+        # Peso para o loss da importancia dos expertos
+        self.w_importance = config.w_importance
+        # Peso para o loss de balanceo de carga dos expertos
+        self.w_load = config.w_load
+        # Peso para o loss de penalización de logits grandes
+        self.lambda_z = config.lambda_z
+        # Peso para o loss de Brais
+        self.w_penalty = config.w_penalty
+        
+        self.importance_loss = 0.0
+        self.load_loss = 0.0
+        self.z_loss = 0.0
+        self.penalty = 0.0
+               
+        
+    def get_importance_loss(self, probs, selected_experts):
+    
+        probs = probs.unsqueeze(1)
+        selected_experts = selected_experts.unsqueeze(1)
+                
+        importance = torch.zeros(self.n_experts, device=probs.device, dtype=probs.dtype)
+        
+        importance.scatter_add_(0, selected_experts.view(-1), probs.view(-1))
+        cv2 = importance.var(unbiased=False) / (torch.mean(importance)**2)
+        return self.w_importance * cv2
     
     def get_z_loss(self, gate_logits):
         
@@ -151,65 +552,124 @@ class MoE(nn.Module):
         loss = torch.mean(logsumexp ** 2)
         return self.lambda_z * loss
 
+      
+    def get_load_loss(self, probs, top1_experts):
         
+        S = top1_experts.numel()
+        
+        P_i = probs.mean(dim=0)
+        fi = torch.bincount(top1_experts, minlength=self.n_experts).float() / S
+
+        # loss = α * N * sum(f_i * P_i)
+        load_loss = self.w_load * self.n_experts * torch.sum(fi * P_i)
+
+        return load_loss
+          
+          
+    def get_penalty(self, gate_logits):
+
+        probs = F.softmax(gate_logits / 1.66, dim=-1)
+
+        # Penalty A: castiga scores axustados
+        penalty_a = torch.mean(probs * (1. - probs))
+
+        # Penalty B: favorece equilibro do uso dos camiños
+        prob_mean = probs.mean(dim=0)  # (n_experts,)
+        penalty_b = (1. / self.n_experts - torch.mean(prob_mean * (1. - prob_mean)))
+
+        return penalty_a + penalty_b
+  
     def forward(self, x):
-        # Se convierte la dimension a (B*T, C) -> (B*T, n_embd)        
+        
+        
+        # Imprimir dispositivo de los expertos:
+        for expert in self.experts:
+            print(expert.device)
+        return
+        
+        
+        # Aplanamos as entradas x: (B*T, C)      
         x_squashed = x.view(-1, x.shape[-1])
         
-        # (B*T, n_experts) -> por cada token se obtiene un vector de n_experts dimensiones, cada experto tiene una puntuación
+        # (B*T, n_experts) -> por cada token obtéñense os logits de cada experto
         gate_logits = self.gate(x_squashed)
         
-        # z_loss = self.get_z_loss(gate_logits)
+        # Calculamos o penalty da implementación de Brais
+        if self.w_penalty > 0:
+            self.penalty = self.w_penalty * self.get_penalty(gate_logits)
         
+        # Calculamos o z-loss
+        if self.lambda_z > 0:
+            self.z_loss = self.get_z_loss(gate_logits)
+        
+        # Introducimos ruido gaussiano ós logits dos expertos
         noise_std = F.softplus(self.noise_layer(x_squashed))
         gate_logits += torch.randn_like(gate_logits) * noise_std
         
-        # BIAS de DeepSeek
-        # gate_logits += self.bias
+        # Engadimos o bias de DeepSeek
+        if self.bias is not None:
+            gate_logits += self.bias
         
-        self.load_loss = self.get_load_loss(gate_logits, noise_std)
-                
-        # Se seleccionan las top n_experts_per_tok puntuaciones de expertos por token
-        weights, selected_experts = torch.topk(gate_logits, self.n_experts_per_tok)
-        # weights nos dice las top n_experts_per_tok puntuaciones de expertos por token
-        # selected_experts nos dice que top n_experts_per_tok expertos son los seleccionados para cada token
+        # Aplicamos a estratexia top-k:
+        # weights representa as puntuacións dos top-k expertos
+        # selected_experts contén os indices dos topk expertos seleccionados para cada token
                     # selected_experts =
                     # [[0, 2],  # Token 0 → Expertos 0 y 2
                     # [1, 3],  # Token 1 → Expertos 1 y 3
                     # [0, 3],  # Token 2 → Expertos 0 y 3
-                    # [1, 2]]  # Token 3 → Expertos 1 y 2
+                    # [1, 2]]  # Token 3 → Expertos 1 y 2 
+        weights, selected_experts = torch.topk(gate_logits, self.topk)
     
-        # Aplicamos softmax en la dimension de las filas, por cada token se obtiene un multiplicador para cada experto,
-        # ¿cuanto pondera cada experto en la representación de un token?
+        # Aplicamos softmax para obter os scores de cada experto, contén a información de canto contribuirá cada experto
         weights = F.softmax(
             weights,
             dim=1,
             dtype=torch.float,
         ).type_as(x)    
         
-        # self.importance_loss = self.get_auxiliary_loss(weights, selected_experts)
+        # Calculamos o loss que equilibra a importancia de cada experto
+        if self.w_importance > 0:
+            self.importance_loss = self.get_importance_loss(weights, selected_experts)
+                    
+        # Calculamos o loss que equilibra a carga entre os expertos
+        if self.w_load > 0:
+            # Para seguir correctamente o paper de Switch Transformer, o loss de carga ten que calcularse cos logits do gate, sen topk
+            router_probs = F.softmax(gate_logits, dim=-1, dtype=torch.float).type_as(x)
+            top1_experts = selected_experts[:, 0]
+            self.load_loss = self.get_load_loss(router_probs, top1_experts)
         
+        # Creamos un tensor para gardar as asignacións a cada experto
         self.total_assigment_count = torch.zeros(self.n_experts, device=x.device, dtype=torch.int32)
 
+        # results conterá os resultados finais
         results = torch.zeros_like(x_squashed)
+        
         for i, expert in enumerate(self.experts):
+            # Obtemos batch_idx e nth_expert:
+                # batch_idx representa os indices dos tokens que van ao experto i
+                # nth_expert representa en que índice dos top-k expertos se atopa o experto i
+                        # selected_experts =
+                        # [[0, 2],   # token 0 → expertos 0 e 2
+                        #  [1, 3],   # token 1 → expertos 1 e 3
+                        #  [0, 3],   # token 2 → expertos 0 e 3
+                        #  [1, 2]]   # token 3 → expertos 1 e 2
+                        
+                        # batch_idx = [0, 3]    # Tokens 0 e 3 van ó experto 2
+                        # nth_expert = [1, 1]   # Dos tokens 0 e 3, o experto 2 é o segundo, índice 1
             batch_idx, nth_expert = torch.where(selected_experts == i)
 
+            # Actualizamos o contador de asignacións para cada experto
             self.total_assigment_count[i] += batch_idx.shape[0]
-            # batch_idx nos dice a que experto va cada fila, cada token
-            # nth_expert nos dice qué indice en cada fila, cada token, corresponde al experto i
-            
-                    # batch_idx = [0, 3]    # Tokens 0 y 3 van al experto 2
-                    # nth_expert = [1, 1]   # En cada fila, el experto 2 es el segundo seleccionado (índice 1)
             
             if len(batch_idx) > 0:
-                # Pasamos los tokens seleccionados al experto i
+                # Pasamos os tokens seleccionados ó experto i
                 expert_logits = expert(x_squashed[batch_idx])
-                # Multiplicamos la salida del experto por el peso que le corresponde, se añade una dimensión para que las dimensiones sean compatibles
-                # weights[batch_idx, nth_expert, None] contiene las contribuciones del experto i para cada token
+                # Multiplicamos a saída do experto polo peso que lle corresponde, añádese unha dimensión para sexan compatibles
+                # weights[batch_idx, nth_expert, None] contén a contribución do experto i para cada token
                 results[batch_idx] += weights[batch_idx, nth_expert, None] * expert_logits
                         
-        return results.view_as(x), self.load_loss
+        # Devolvemos á forma orixinal das entradas e retornamos as perdas auxiliares
+        return results.view_as(x), self.load_loss + self.importance_loss + self.z_loss + self.penalty
         
 
 class Block(nn.Module):
@@ -219,8 +679,8 @@ class Block(nn.Module):
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        if config.expert_implementation == "MoE":
-            self.moe_layer = MoE(config)
+        if config.expert_implementation == "OLNNMoE":
+            self.moe_layer = OLNNMoE(config)
         elif config.expert_implementation == "SwitchMoE":
             self.moe_layer = SwitchMoE(config)
         # self.mlp = MLP(config)
@@ -234,16 +694,19 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
+    ddp_rank: int = 0
+    ddp_world_size: int = 0
     block_size: int = 1024 # max sequence length
     vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
     n_experts: int = 4
-    n_experts_per_tok: int = 2
+    topk: int = 2
     w_importance: float = 0.1
     w_load: float = 0.1
-    expert_implementation: str = "MoE"
+    # GShardMoE | SwitchMoE | OLNNMoE | CondMLP
+    expert_implementation: str = "OLNNMoE"
     lambda_z: float = 0.001
     # expert_capacity: int = 1536 # = expert_capacity =  (B*T / n_experts) * capacity_factor = 1.5, usamos T en vez de B*T por la forma en que se hace forward en SwitchMoE
 
@@ -523,7 +986,7 @@ if __name__ == "__main__":
     train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
     val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
-    torch.set_float32_matmul_precision('high')
+    torch.set_float32_matmul_precision('high') # BF16?
 
     # Funcion que actuaiza el bias en cada capa MoE del modelo
     def update_moe_layer_bias(moe_layer, gamma):
@@ -564,7 +1027,7 @@ if __name__ == "__main__":
             return None, torch.tensor(load_loss).mean().item()            
 
     # create model
-    model = GPT(GPTConfig(vocab_size=50304))
+    model = GPT(GPTConfig(vocab_size=50304, ddp_rank=ddp_rank, ddp_world_size=ddp_world_size))
     # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
     model.to(device)
     use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix

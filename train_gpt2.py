@@ -62,14 +62,16 @@ class CondMLP(nn.Module):
  
     def __init__(self, config):
         super().__init__()
-        self.guesser = nn.Linear(config.n_embd, config.n_paths)
+        
+        self.n_paths = config.n_experts
+        
+        self.guesser = nn.Linear(config.n_embd, self.n_paths)
         self.c_fc    = nn.Linear(config.n_embd, 4*config.n_embd, bias=False)
-        self.b_fc    = nn.Embedding(config.n_paths, 4*config.n_embd)
+        self.b_fc    = nn.Embedding(self.n_paths, 4*config.n_embd)
         self.gelu    = nn.GELU(approximate='tanh')
         self.c_proj  = nn.Linear(4*config.n_embd, config.n_embd, bias=False)
-        self.b_proj  = nn.Embedding(config.n_paths, config.n_embd)
+        self.b_proj  = nn.Embedding(self.n_paths, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
-        self.n_paths = config.n_paths
         
         # Bias de DeepSeek
         self.bias = nn.Parameter(torch.empty(self.n_experts)) if config.bias else None
@@ -170,27 +172,15 @@ class GShardMoE(nn.Module):
         self.n_experts = config.n_experts
         assert self.n_experts > 0
         
-        self.ddp_rank = config.ddp_rank
-        self.ddp_world_size = config.ddp_world_size
-        
-        # Creamos os expertos de forma distribuída
-        self.experts_per_gpu = [i for i in range(self.n_experts) if i % self.ddp_world_size == self.ddp_rank]
-        self.expert_locations = {i: i % self.ddp_world_size for i in range(self.n_experts)}
-        
-        self.experts = nn.ModuleDict({
-            str(i): FFN(config).to(f'cuda:{self.ddp_rank}') for i in self.experts_per_gpu
-        })
-        
+        # Definición dos expertos
+        self.experts = nn.ModuleList([FFN(config) for _ in range(self.n_experts)])
         # Pesos do gate
         self.gate = nn.Linear(config.n_embd, self.n_experts, bias=False)
         # Bias de DeepSeek
         self.bias = nn.Parameter(torch.empty(self.n_experts)) if config.bias else None
         
-        # Top-k expertos a seleccionar por token
-        self.topk = config.topk
         # Capacidade dos expertos
         self.expert_capacity = config.expert_capacity
-        self.experts = nn.ModuleList([FFN(config) for _ in range(self.n_experts)])
         
         # Peso para o loss da importancia dos expertos
         self.w_importance = config.w_importance
@@ -261,7 +251,8 @@ class GShardMoE(nn.Module):
             dtype=torch.float,
         ).type_as(x)
         
-        weights, selected_experts = torch.topk(probs, k=2, dim=-1)  # (S, 2)
+        # K = 2 constante xa que modificalo implicaría reimplementar o algoritmo do paper GShard
+        weights, selected_experts = torch.topk(probs, k=2, dim=-1)
         g1, g2 = weights[:, 0], weights[:, 1]
         e1, e2 = selected_experts[:, 0], selected_experts[:, 1]
         
@@ -310,7 +301,7 @@ class GShardMoE(nn.Module):
             out = out * weights                       
             y_flat[token_ids] += out                  
 
-        y = y_flat.view(B, T, C)
+        y = y_flat.view_as(x)
         
         return y
 
@@ -324,24 +315,15 @@ class SwitchMoE(nn.Module):
         self.n_experts = config.n_experts
         assert self.n_experts > 0
         
-        self.ddp_rank = config.ddp_rank
-        self.ddp_world_size = config.ddp_world_size
-        
-        # Creamos os expertos de forma distribuída
-        self.experts_per_gpu = [i for i in range(self.n_experts) if i % self.ddp_world_size == self.ddp_rank]
-        self.expert_locations = {i: i % self.ddp_world_size for i in range(self.n_experts)}
-        
-        self.experts = nn.ModuleDict({
-            str(i): FFN(config).to(f'cuda:{self.ddp_rank}') for i in self.experts_per_gpu
-        })
-        
+        # Definición dos expertos
+        self.experts = nn.ModuleList([FFN(config) for _ in range(self.n_experts)])
         # Pesos do gate
         self.gate = nn.Linear(config.n_embd, self.n_experts, bias=False)
         # Bias de DeepSeek
         self.bias = nn.Parameter(torch.empty(self.n_experts)) if config.bias else None
         
+        # Capacidade dos expertos
         self.expert_capacity = config.expert_capacity
-        self.experts = nn.ModuleList([FFN(config) for _ in range(self.n_experts)])
         
         # Peso para o loss da importancia dos expertos
         self.w_importance = config.w_importance
@@ -498,18 +480,8 @@ class OLNNMoE(nn.Module):
         self.n_experts = config.n_experts
         assert self.n_experts > 0
         
-        self.ddp_rank = config.ddp_rank
-        self.ddp_world_size = config.ddp_world_size
-        
-        # Creamos os expertos de forma distribuída
-        self.experts_per_gpu = [i for i in range(self.n_experts) if i % self.ddp_world_size == self.ddp_rank]
-        self.expert_locations = {i: i % self.ddp_world_size for i in range(self.n_experts)}
-        
-        self.experts = nn.ModuleDict({
-            str(i): FFN(config).to(f'cuda:{self.ddp_rank}') for i in self.experts_per_gpu
-        })
-        
-        
+        # Capacidade dos expertos
+        self.experts = nn.ModuleList([FFN(config) for _ in range(self.n_experts)])
         # Pesos do gate
         self.gate = nn.Linear(config.n_embd, self.n_experts, bias=False)
         # Pesos de ruido gaussiano
@@ -528,11 +500,6 @@ class OLNNMoE(nn.Module):
         self.lambda_z = config.lambda_z
         # Peso para o loss de Brais
         self.w_penalty = config.w_penalty
-        
-        self.importance_loss = 0.0
-        self.load_loss = 0.0
-        self.z_loss = 0.0
-        self.penalty = 0.0
                
         
     def get_importance_loss(self, probs, selected_experts):
@@ -577,16 +544,9 @@ class OLNNMoE(nn.Module):
         prob_mean = probs.mean(dim=0)  # (n_experts,)
         penalty_b = (1. / self.n_experts - torch.mean(prob_mean * (1. - prob_mean)))
 
-        return penalty_a + penalty_b
+        return (penalty_a + penalty_b) * self.w_penalty
   
-    def forward(self, x):
-        
-        
-        # Imprimir dispositivo de los expertos:
-        for expert in self.experts:
-            print(expert.device)
-        return
-        
+    def forward(self, x):        
         
         # Aplanamos as entradas x: (B*T, C)      
         x_squashed = x.view(-1, x.shape[-1])
@@ -596,7 +556,8 @@ class OLNNMoE(nn.Module):
         
         # Calculamos o penalty da implementación de Brais
         if self.w_penalty > 0:
-            self.penalty = self.w_penalty * self.get_penalty(gate_logits)
+            self.penalty = self.get_penalty(gate_logits)
+            print(f"Penalty: {self.penalty}")
         
         # Calculamos o z-loss
         if self.lambda_z > 0:
@@ -639,7 +600,7 @@ class OLNNMoE(nn.Module):
             self.load_loss = self.get_load_loss(router_probs, top1_experts)
         
         # Creamos un tensor para gardar as asignacións a cada experto
-        self.total_assigment_count = torch.zeros(self.n_experts, device=x.device, dtype=torch.int32)
+        self.total_assigment_count = torch.zeros(self.n_experts, device=x.device, dtype=torch.long)
 
         # results conterá os resultados finais
         results = torch.zeros_like(x_squashed)
@@ -669,7 +630,7 @@ class OLNNMoE(nn.Module):
                 results[batch_idx] += weights[batch_idx, nth_expert, None] * expert_logits
                         
         # Devolvemos á forma orixinal das entradas e retornamos as perdas auxiliares
-        return results.view_as(x), self.load_loss + self.importance_loss + self.z_loss + self.penalty
+        return results.view_as(x), self.penalty
         
 
 class Block(nn.Module):
@@ -683,7 +644,10 @@ class Block(nn.Module):
             self.moe_layer = OLNNMoE(config)
         elif config.expert_implementation == "SwitchMoE":
             self.moe_layer = SwitchMoE(config)
-        # self.mlp = MLP(config)
+        elif config.expert_implementation == "GShardMoE":
+            self.moe_layer = GShardMoE(config)
+        elif config.expert_implementation == "CondMLP":
+            self.moe_layer = CondMLP(config)
 
     def forward(self, x):
         # Aqui en la atención los tokens se "comunican" entre ellos
@@ -694,21 +658,22 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig:
-    ddp_rank: int = 0
-    ddp_world_size: int = 0
     block_size: int = 1024 # max sequence length
     vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
+    
+    expert_implementation: str = "CondMLP"  # GShardMoE | SwitchMoE | OLNNMoE | CondMLP
     n_experts: int = 4
     topk: int = 2
-    w_importance: float = 0.1
+    expert_capacity: int = 1536 # = expert_capacity =  (B*T / n_experts) * capacity_factor = 1.5, usamos T en vez de B*T por la forma en que se hace forward en SwitchMoE
+
+    w_importance: float = 0
     w_load: float = 0.1
-    # GShardMoE | SwitchMoE | OLNNMoE | CondMLP
-    expert_implementation: str = "OLNNMoE"
-    lambda_z: float = 0.001
-    # expert_capacity: int = 1536 # = expert_capacity =  (B*T / n_experts) * capacity_factor = 1.5, usamos T en vez de B*T por la forma en que se hace forward en SwitchMoE
+    lambda_z: float = 0
+    w_penalty: float = 0.1
+    bias: bool = False
 
 class GPT(nn.Module):
 
@@ -1027,7 +992,7 @@ if __name__ == "__main__":
             return None, torch.tensor(load_loss).mean().item()            
 
     # create model
-    model = GPT(GPTConfig(vocab_size=50304, ddp_rank=ddp_rank, ddp_world_size=ddp_world_size))
+    model = GPT(GPTConfig(vocab_size=50304))
     # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
     model.to(device)
     use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix

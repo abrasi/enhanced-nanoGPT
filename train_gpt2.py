@@ -513,7 +513,10 @@ class OLNNMoE(nn.Module):
         self.lambda_z = config.lambda_z
         # Peso para o loss de Brais
         self.w_penalty = config.w_penalty
-               
+        
+    @torch.no_grad()
+    def reset_stats(self):
+        self.total_assigment_count.zero_()
         
     def get_importance_loss(self, probs, selected_experts):
     
@@ -610,15 +613,11 @@ class OLNNMoE(nn.Module):
             top1_experts = selected_experts[:, 0]
             self.load_loss = self.get_load_loss(router_probs, top1_experts)
         
-        # Creamos un tensor para gardar as asignacións a cada experto
-        
-
+        # Engadimos as asignacións dos expertos o reconto total
         with torch.no_grad():
             top1_experts = selected_experts[:, 0].view(-1)
-            self.total_assigment_count.zero_()
             ones = torch.ones_like(top1_experts, dtype=torch.long)
             self.total_assigment_count.scatter_add_(0, top1_experts, ones)
-            print("Metrica inicial", self.total_assigment_count)
 
         # results conterá os resultados finais
         results = torch.zeros_like(x_squashed)
@@ -1022,8 +1021,8 @@ if __name__ == "__main__":
     warmup_steps = 715
     max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
-    # gamma = 0.001 # Hiperparametro para el ajuste del bias del Gate de MoE
-    # bias_update_step = int(max_steps * 0.97) # Más o menos en DeepSeek el bias de Gating de MoE pasa a ser 0 a partir de este punto
+    gamma = 0.001 # Hiperparametro para el ajuste del bias del Gate de MoE
+    bias_update_step = int(max_steps * 0.97) # Más o menos en DeepSeek el bias de Gating de MoE pasa a ser 0 a partir de este punto
 
     def get_lr(it):
         # 1) linear warmup for warmup_iters steps
@@ -1180,43 +1179,10 @@ if __name__ == "__main__":
         #             update_moe_layer_bias(dist, device, block.moe_layer, gamma)
         #--------------------------------           
         
-        # Expert assigment count
-        total_assigment_count = []
-        # Promedio de conteo de asignaciones a expertos en todas los bloques transformer
-        # fist_assigment_mean = None
-        # Recogemos los conteos de asignaciones a expertos de todas las capas MoE
+        # Reseteamos os contadores de asignación de expertos para realizar o conteo despois do gradient accumulation
         for block in model.module.transformer.h:
-            
-            if hasattr(block, 'moe_layer') and hasattr(block.moe_layer, 'total_assigment_count'):
-                # first_assigment_counts.append(block.moe_layer.first_expert_assigment_count)
-                total_assigment_count.append(block.moe_layer.total_assigment_count)
-                print("Metrica final", block.moe_layer.total_assigment_count)
-                # salimos del programa:
-                exit()
-                
-        if total_assigment_count:
-            # Stack: obtiene un tensor de forma (n_layer, n_experts)
-            # 2 tensores: uno para la asignación del primer experto y otro para la asignación a la primera y segunda opción
-            # first_assigment_counts_stack = torch.stack(first_assigment_counts, dim=0)
-            total_assigment_count_stack = torch.stack(total_assigment_count, dim=0)
-            # Promedio a lo largo de los bloques transformer (dim=0)
-            # fist_assigment_mean = first_assigment_counts_stack.float().mean(dim=0)
-            total_mean = total_assigment_count_stack.float().mean(dim=0)
-                    
-        if len(total_assigment_count) > 0:
-            if ddp:
-                # Se promedian los tokens recibidos por los expertos entre las GPUs
-                # dist.all_reduce(fist_assigment_mean, op=dist.ReduceOp.AVG)
-                dist.all_reduce(total_mean, op=dist.ReduceOp.AVG)
-                total_tokens = B * T * 2 # Expertos activados = 2
-                # total_assigment = total_mean.sum()
-                # dropped_tokens = total_tokens - total_assigment
-                assigment_percentage = total_mean / float(total_tokens)
-                # first_assignment_percentage = fist_assigment_mean.float() / float(total_tokens)
-                # dropped_percentage = float(dropped_tokens) / total_tokens
-        # -----------------------
-        _, load_loss = get_auxiliary_losses()
-                
+            block.moe_layer.reset_stats()
+  
         loss_accum = 0.0
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch()
@@ -1240,6 +1206,25 @@ if __name__ == "__main__":
         lr = get_lr(step)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
+            
+                
+        # Conteo os tokens asignados a cada experto
+        layer_counts = []
+        for block in model.module.transformer.h:
+            if hasattr(block, 'moe_layer'):
+                layer_counts.append(block.moe_layer.total_assigment_count)
+                print(block.moe_layer.total_assigment_count)
+                
+        # Promediamos os contadores de asignación de expertos entre os bloques e logo as GPUs
+        counts_blocks = torch.stack(layer_counts)
+        mean_blocks = counts_blocks.float().mean(dim=0)
+        dist.all_reduce(mean_blocks, op=dist.ReduceOp.AVG)
+        percentage = mean_blocks / (total_batch_size / ddp_world_size)
+        if master_process:
+            print(percentage)
+        # ------------------------------------------
+        
+        
         optimizer.step()
         if device_type == "cuda":
             torch.cuda.synchronize() # wait for the GPU to finish work

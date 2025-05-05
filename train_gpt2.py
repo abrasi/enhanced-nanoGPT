@@ -74,7 +74,9 @@ class CondMLP(nn.Module):
         self.c_proj.NANOGPT_SCALE_INIT = 1
         
         # Bias de DeepSeek
-        self.bias = nn.Parameter(torch.empty(self.n_experts)) if config.bias else None
+        self.bias = nn.Parameter(torch.empty(self.n_paths)) if config.bias else None
+        
+        self.register_buffer("total_assigment_count", torch.zeros(self.n_paths, dtype=torch.long))
         
         self.w_importance = config.w_importance
         # Peso para o loss de balanceo de carga dos expertos
@@ -153,8 +155,17 @@ class CondMLP(nn.Module):
         prob = torch.softmax(guess / 1.66, dim=-1)
         selection = self.__get_selection(prob)
         
+        with torch.no_grad():
+            self.total_assigment_count.zero_()
+            flat_sel = selection.view(-1)
+            self.total_assigment_count.scatter_add_(0, flat_sel, torch.ones_like(flat_sel, dtype=torch.long))
+            print(self.total_assigment_count)
+        
         if self.w_load > 0:
             self.load_loss = self.get_load_balance_loss(prob, selection)
+            
+        if self.w_importance > 0:
+            self.importance_loss = self.get_importance_loss(prob, selection)
         
         x2 = self.c_fc(x) + self.b_fc(selection)
         x2 = self.gelu(x2)
@@ -489,6 +500,8 @@ class OLNNMoE(nn.Module):
         # Bias de DeepSeek
         self.bias = nn.Parameter(torch.empty(self.n_experts)) if config.bias else None
         
+        self.register_buffer("total_assigment_count", torch.zeros(self.n_experts, dtype=torch.long))
+        
         # Top-k expertos a seleccionar por token
         self.topk = config.topk
         
@@ -546,8 +559,7 @@ class OLNNMoE(nn.Module):
 
         return (penalty_a + penalty_b) * self.w_penalty
   
-    def forward(self, x):        
-        
+    def forward(self, x):               
         # Aplanamos as entradas x: (B*T, C)      
         x_squashed = x.view(-1, x.shape[-1])
         
@@ -557,7 +569,6 @@ class OLNNMoE(nn.Module):
         # Calculamos o penalty da implementación de Brais
         if self.w_penalty > 0:
             self.penalty = self.get_penalty(gate_logits)
-            print(f"Penalty: {self.penalty}")
         
         # Calculamos o z-loss
         if self.lambda_z > 0:
@@ -600,7 +611,14 @@ class OLNNMoE(nn.Module):
             self.load_loss = self.get_load_loss(router_probs, top1_experts)
         
         # Creamos un tensor para gardar as asignacións a cada experto
-        self.total_assigment_count = torch.zeros(self.n_experts, device=x.device, dtype=torch.long)
+        
+
+        with torch.no_grad():
+            top1_experts = selected_experts[:, 0].view(-1)
+            self.total_assigment_count.zero_()
+            ones = torch.ones_like(top1_experts, dtype=torch.long)
+            self.total_assigment_count.scatter_add_(0, top1_experts, ones)
+            print("Metrica inicial", self.total_assigment_count)
 
         # results conterá os resultados finais
         results = torch.zeros_like(x_squashed)
@@ -618,9 +636,6 @@ class OLNNMoE(nn.Module):
                         # batch_idx = [0, 3]    # Tokens 0 e 3 van ó experto 2
                         # nth_expert = [1, 1]   # Dos tokens 0 e 3, o experto 2 é o segundo, índice 1
             batch_idx, nth_expert = torch.where(selected_experts == i)
-
-            # Actualizamos o contador de asignacións para cada experto
-            self.total_assigment_count[i] += batch_idx.shape[0]
             
             if len(batch_idx) > 0:
                 # Pasamos os tokens seleccionados ó experto i
@@ -664,16 +679,16 @@ class GPTConfig:
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
     
-    expert_implementation: str = "CondMLP"  # GShardMoE | SwitchMoE | OLNNMoE | CondMLP
+    expert_implementation: str = "OLNNMoE"  # GShardMoE | SwitchMoE | OLNNMoE | CondMLP
     n_experts: int = 4
     topk: int = 2
     expert_capacity: int = 1536 # = expert_capacity =  (B*T / n_experts) * capacity_factor = 1.5, usamos T en vez de B*T por la forma en que se hace forward en SwitchMoE
 
-    w_importance: float = 0
+    w_importance: float = 0.1
     w_load: float = 0.1
-    lambda_z: float = 0
+    lambda_z: float = 0.1
     w_penalty: float = 0.1
-    bias: bool = False
+    bias: bool = True
 
 class GPT(nn.Module):
 
@@ -995,11 +1010,11 @@ if __name__ == "__main__":
     model = GPT(GPTConfig(vocab_size=50304))
     # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
     model.to(device)
-    use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+    use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
     if use_compile:
         model = torch.compile(model)
     if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
     max_lr = 6e-4
@@ -1080,6 +1095,7 @@ if __name__ == "__main__":
 
         # once in a while evaluate hellaswag
         if (step % 250 == 0 or last_step) and (not use_compile):
+            print("evaluating hella swag")
             num_correct_norm = 0
             num_total = 0
             for i, example in enumerate(iterate_examples("val")):
@@ -1165,16 +1181,18 @@ if __name__ == "__main__":
         #--------------------------------           
         
         # Expert assigment count
-        # first_assigment_counts = []
         total_assigment_count = []
         # Promedio de conteo de asignaciones a expertos en todas los bloques transformer
         # fist_assigment_mean = None
-        # Recogemos los conteos de asignaciones a expertos de todas las capas MoE 
+        # Recogemos los conteos de asignaciones a expertos de todas las capas MoE
         for block in model.module.transformer.h:
             
             if hasattr(block, 'moe_layer') and hasattr(block.moe_layer, 'total_assigment_count'):
                 # first_assigment_counts.append(block.moe_layer.first_expert_assigment_count)
                 total_assigment_count.append(block.moe_layer.total_assigment_count)
+                print("Metrica final", block.moe_layer.total_assigment_count)
+                # salimos del programa:
+                exit()
                 
         if total_assigment_count:
             # Stack: obtiene un tensor de forma (n_layer, n_experts)
@@ -1185,7 +1203,7 @@ if __name__ == "__main__":
             # fist_assigment_mean = first_assigment_counts_stack.float().mean(dim=0)
             total_mean = total_assigment_count_stack.float().mean(dim=0)
                     
-        if total_assigment_count is not None:
+        if len(total_assigment_count) > 0:
             if ddp:
                 # Se promedian los tokens recibidos por los expertos entre las GPUs
                 # dist.all_reduce(fist_assigment_mean, op=dist.ReduceOp.AVG)

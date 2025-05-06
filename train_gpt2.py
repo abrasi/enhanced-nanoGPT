@@ -148,6 +148,9 @@ class CondMLP(nn.Module):
         return selection
 
     def forward(self, x):
+        
+        auxiliar_loss = 0.0
+        
         guess = self.guesser(x)
         
         if self.bias is not None:
@@ -155,6 +158,7 @@ class CondMLP(nn.Module):
         
         if self.lambda_z > 0:
             self.z_loss = self.get_z_loss(guess)
+            auxiliar_loss += self.z_loss
         
         prob = torch.softmax(guess / 1.66, dim=-1)
         selection = self.__get_selection(prob)
@@ -165,15 +169,22 @@ class CondMLP(nn.Module):
         
         if self.w_load > 0:
             self.load_loss = self.get_load_balance_loss(prob, selection)
+            auxiliar_loss += self.load_loss
             
         if self.w_importance > 0:
             self.importance_loss = self.get_importance_loss(prob, selection)
+            auxiliar_loss += self.importance_loss
         
         x2 = self.c_fc(x) + self.b_fc(selection)
         x2 = self.gelu(x2)
         x2 = self.c_proj(x2) + self.b_proj(selection)
-        self.penalty = self.__get_penalty(prob)
-        return x2 + x, self.penalty
+        
+        if self.w_penalty > 0:
+            self.penalty = self.w_penalty * self.__get_penalty(prob)
+            auxiliar_loss += self.penalty
+        
+        
+        return x2 + x, auxiliar_loss
      
     
 class GShardMoE(nn.Module):
@@ -246,6 +257,9 @@ class GShardMoE(nn.Module):
         return penalty_a + penalty_b
         
     def forward(self, x):
+        
+        auxiliar_loss = 0.0
+
         B, T, C = x.shape
         S = B * T
         x_squashed = x.view(-1, x.shape[-1])
@@ -257,9 +271,11 @@ class GShardMoE(nn.Module):
             
         if self.w_penalty > 0:
             self.penalty = self.w_penalty * self.get_penalty(router_logits)
+            auxiliar_loss += self.penalty
             
         if self.lambda_z > 0:
             self.z_loss = self.get_z_loss(router_logits)
+            auxiliar_loss += self.z_loss
         
         probs = F.softmax(
             router_logits,
@@ -291,7 +307,9 @@ class GShardMoE(nn.Module):
             c_e1[expert] += 1
                 
         # Calcular pérdida auxiliar
-        self.load_loss = self.get_load_balance_loss(probs, expert_onehot)
+        if self.w_load > 0:
+            self.load_loss = self.get_load_balance_loss(probs, expert_onehot)
+            auxiliar_loss += self.load_loss
 
         # Asignación ao top2 estocástico
         rand_vals = torch.rand(S, device=x.device)
@@ -303,6 +321,7 @@ class GShardMoE(nn.Module):
             
         if self.w_importance > 0:
             self.importance_loss = self.get_importance_loss()
+            auxiliar_loss += self.importance_loss
             
         with torch.no_grad():
             top1_experts = e1.view(-1)
@@ -328,7 +347,7 @@ class GShardMoE(nn.Module):
 
         y = y_flat.view_as(x)
         
-        return y
+        return y, auxiliar_loss
 
         
 class SwitchMoE(nn.Module): 
@@ -428,6 +447,8 @@ class SwitchMoE(nn.Module):
     
     def route(self, x):
         
+        auxiliar_loss = 0.0
+        
         B, T, C = x.shape
         
         x_flat = x.view(B*T, C)
@@ -440,9 +461,11 @@ class SwitchMoE(nn.Module):
         
         if self.w_penalty > 0:
             self.penalty = self.w_penalty * self.get_penalty(router_logits)
+            auxiliar_loss += self.penalty
         
         if self.lambda_z > 0:
             self.z_loss = self.get_z_loss(router_logits)
+            auxiliar_loss += self.z_loss
         
         router_probs = F.softmax(
             router_logits,
@@ -474,9 +497,11 @@ class SwitchMoE(nn.Module):
         if self.w_load > 0:
             # No paper de Switch Transformer non se especifica se o loss calculase coas asignacións REAIS, contando co expert capacity, ou se cos intentos de asignacións do Gate, déixase igual que en GShard
             self.load_loss = self.get_load_balance_loss(router_probs, top1_expert_mask)
+            auxiliar_loss += self.load_loss
             
         if self.w_importance > 0:
             self.importance_loss = self.get_importance_loss(top1_weight, top1_idx)
+            auxiliar_loss += self.importance_loss
             
         router_probs = torch.max(router_probs, dim=-1).values.unsqueeze(-1)
 
@@ -588,7 +613,10 @@ class OLNNMoE(nn.Module):
 
         return (penalty_a + penalty_b) * self.w_penalty
   
-    def forward(self, x):               
+    def forward(self, x):
+        
+        auxiliary_loss = 0.0
+              
         # Aplanamos as entradas x: (B*T, C)      
         x_squashed = x.view(-1, x.shape[-1])
         
@@ -598,10 +626,12 @@ class OLNNMoE(nn.Module):
         # Calculamos o penalty da implementación de Brais
         if self.w_penalty > 0:
             self.penalty = self.get_penalty(gate_logits)
+            auxiliary_loss += self.penalty
         
         # Calculamos o z-loss
         if self.lambda_z > 0:
             self.z_loss = self.get_z_loss(gate_logits)
+            auxiliary_loss += self.z_loss
         
         # Introducimos ruido gaussiano ós logits dos expertos
         noise_std = F.softplus(self.noise_layer(x_squashed))
@@ -631,6 +661,7 @@ class OLNNMoE(nn.Module):
         # Calculamos o loss que equilibra a importancia de cada experto
         if self.w_importance > 0:
             self.importance_loss = self.get_importance_loss(weights, selected_experts)
+            auxiliary_loss += self.importance_loss
                     
         # Calculamos o loss que equilibra a carga entre os expertos
         if self.w_load > 0:
@@ -638,6 +669,7 @@ class OLNNMoE(nn.Module):
             router_probs = F.softmax(gate_logits, dim=-1, dtype=torch.float).type_as(x)
             top1_experts = selected_experts[:, 0]
             self.load_loss = self.get_load_loss(router_probs, top1_experts)
+            auxiliary_loss += self.load_loss
         
         # Engadimos as asignacións dos expertos o reconto total
         with torch.no_grad():
@@ -1036,7 +1068,7 @@ if __name__ == "__main__":
     model = GPT(GPTConfig(vocab_size=50304))
     # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
     model.to(device)
-    use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+    use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
     if use_compile:
         model = torch.compile(model)
     if ddp:
@@ -1209,7 +1241,10 @@ if __name__ == "__main__":
         # Reseteamos os contadores de asignación de expertos para realizar o conteo despois do gradient accumulation
         for block in model.module.transformer.h:
             block.moe_layer.reset_stats()
-  
+
+        # Inicializamos os acumuladores dos losses auxiliares
+        aux_losses = {'importance_loss': 0.0, 'load_loss': 0.0, 'z_loss': 0.0, 'penalty': 0.0}
+        
         loss_accum = 0.0
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch()
@@ -1225,9 +1260,35 @@ if __name__ == "__main__":
             # instead of a SUM we want MEAN. Scale the loss here so it comes out right
             loss = loss / grad_accum_steps
             loss_accum += loss.detach()
+            
+            with torch.no_grad():
+                for block in model.module.transformer.h:
+                    moe = block.moe_layer
+                    aux_losses['importance_loss']  += getattr(moe, 'importance_loss', 0.0)
+                    aux_losses['load_loss'] += getattr(moe, 'load_loss',       0.0)
+                    aux_losses['z_loss']    += getattr(moe, 'z_loss',          0.0)
+                    aux_losses['penalty']  += getattr(moe, 'penalty',         0.0)
+            
             loss.backward()
+            
         if ddp:
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+            
+    
+        # Promediamos as perdas auxiliares
+        num_layers = len(model.module.transformer.h)
+        for k in aux_losses:
+            aux_losses[k] /= (grad_accum_steps * num_layers)
+            aux_losses[k] = torch.tensor(aux_losses[k], device=device)
+
+        if ddp and dist.is_initialized():
+            for v in aux_losses.values():
+                dist.all_reduce(v, op=dist.ReduceOp.AVG)
+
+        aux_losses = {k: v.item() for k, v in aux_losses.items()}
+        #------------------------------------
+        
+        
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         # determine and set the learning rate for this iteration
         lr = get_lr(step)
@@ -1278,10 +1339,28 @@ if __name__ == "__main__":
         tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
         tokens_per_sec = tokens_processed / dt
         if master_process:
-            print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+            
+            parts = [
+                "{k} {v:.3e}".format(k=k, v=v)
+                for k, v in aux_losses.items()
+                if abs(v) > 0
+            ]            
+            loss_str = " | ".join(parts)
+            msg = (f"step {step:5d} | loss: {loss_accum.item():.6f} "
+                    f"| lr {lr:.4e} | norm: {norm:.4f} "
+                    f"| dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+            
+            if loss_str:
+                msg += " | " + loss_str
+                
+            print(msg)
+            
             with open(log_file, "a") as f:
-                # f.write(f"{step} train {loss_accum.item():.6f}, first expert assigment percentage: {first_assignment_percentage.tolist()}, dropped tokens: {dropped_tokens} ({dropped_percentage * 100:.2f}%)\n")
-                f.write(f"{step} train {loss_accum.item():.6f}, load loss {load_loss:.6f} expert assigment percentage: {assigment_percentage.tolist()}\n")
+                f.write(f"{step} train ce {loss_accum.item():.6f}")
+                for k, v in aux_losses.items():
+                    if abs(v) > 0:
+                        f.write(f" {k} {v:.3e}")
+                f.write("\n")
 
     mes = monitor.end_window("epoch")
 

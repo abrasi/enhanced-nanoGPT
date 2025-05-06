@@ -90,6 +90,10 @@ class CondMLP(nn.Module):
         self.load_loss = 0.0
         self.z_loss = 0.0
         self.penalty = 0.0
+        
+    @torch.no_grad()
+    def reset_stats(self):
+        self.total_assigment_count.zero_()
  
     def __get_penalty(self, prob):
         penalty_a = torch.mean(prob * (1. - prob))
@@ -156,10 +160,8 @@ class CondMLP(nn.Module):
         selection = self.__get_selection(prob)
         
         with torch.no_grad():
-            self.total_assigment_count.zero_()
             flat_sel = selection.view(-1)
             self.total_assigment_count.scatter_add_(0, flat_sel, torch.ones_like(flat_sel, dtype=torch.long))
-            print(self.total_assigment_count)
         
         if self.w_load > 0:
             self.load_loss = self.get_load_balance_loss(prob, selection)
@@ -189,6 +191,9 @@ class GShardMoE(nn.Module):
         self.gate = nn.Linear(config.n_embd, self.n_experts, bias=False)
         # Bias de DeepSeek
         self.bias = nn.Parameter(torch.empty(self.n_experts)) if config.bias else None
+        
+        self.register_buffer("total_assigment_count", torch.zeros(self.n_paths, dtype=torch.long))
+        self.register_buffer("total_dropped_count", torch.tensor(0, dtype=torch.long))
         
         # Capacidade dos expertos
         self.expert_capacity = config.expert_capacity
@@ -288,7 +293,7 @@ class GShardMoE(nn.Module):
         # Calcular pérdida auxiliar
         self.load_loss = self.get_load_balance_loss(probs, expert_onehot)
 
-        # Asignación al top-2 (e2), con muestreo estocástico
+        # Asignación ao top2 estocástico
         rand_vals = torch.rand(S, device=x.device)
         for i in range(S):
             expert = e2[i].item()
@@ -298,6 +303,15 @@ class GShardMoE(nn.Module):
             
         if self.w_importance > 0:
             self.importance_loss = self.get_importance_loss()
+            
+        with torch.no_grad():
+            top1_experts = e1.view(-1)
+            ones = torch.ones_like(top1_experts, dtype=torch.long)
+            # top1_experts contén os indices dos expertos seleccionados para cada token, sumamos 1 para cada indice de experto seleccionado
+            self.total_assigment_count.scatter_add_(0, top1_experts, ones)
+            
+            dropped_tokens = (G.sum(dim=-1) == 0)
+            self.total_dropped_count += dropped_tokens.sum()
             
         y_flat = torch.zeros(S, C, device=x.device)
 
@@ -333,6 +347,9 @@ class SwitchMoE(nn.Module):
         # Bias de DeepSeek
         self.bias = nn.Parameter(torch.empty(self.n_experts)) if config.bias else None
         
+        self.register_buffer("total_assigment_count", torch.zeros(self.n_experts, dtype=torch.long))
+        self.register_buffer("total_dropped_count", torch.tensor(0, dtype=torch.long))
+        
         # Capacidade dos expertos
         self.expert_capacity = config.expert_capacity
         
@@ -349,6 +366,11 @@ class SwitchMoE(nn.Module):
         self.load_loss = 0.0
         self.z_loss = 0.0
         self.penalty = 0.0
+        
+    @torch.no_grad()
+    def reset_stats(self):
+        self.total_assigment_count.zero_()
+        self.total_dropped_count.zero_()
              
     def get_z_loss(self, router_logits):
         
@@ -437,13 +459,17 @@ class SwitchMoE(nn.Module):
         token_priority = torch.cumsum(top1_expert_mask, dim=0)
         expert_capacity_mask = token_priority <= self.expert_capacity
 
-        # Intentamos asignar primero a first_expert
+        # Multiplicamos pola máscara de capacidade para descartar os tokens que fan overflow
         expert_index = top1_expert_mask * expert_capacity_mask
-        # Rexistramos os tokens que non se asignaron a ningun experto
-        self.dropped_tokens = (expert_index.sum(dim=-1) == 0)
         
-        self.expert_assigment_count = expert_index.sum(dim=0)
+        with torch.no_grad():
+            # Rexistramos as asignacións dos expertos e os dropped tokens
+            dropped_tokens = (expert_index.sum(dim=-1) == 0)
+            expert_assigment_count = expert_index.sum(dim=0)
 
+            self.total_assigment_count += expert_assigment_count
+            self.total_dropped_count += dropped_tokens.sum()
+            
         # Pérdidas auxiliares
         if self.w_load > 0:
             # No paper de Switch Transformer non se especifica se o loss calculase coas asignacións REAIS, contando co expert capacity, ou se cos intentos de asignacións do Gate, déixase igual que en GShard
@@ -617,6 +643,7 @@ class OLNNMoE(nn.Module):
         with torch.no_grad():
             top1_experts = selected_experts[:, 0].view(-1)
             ones = torch.ones_like(top1_experts, dtype=torch.long)
+            # top1_experts contén os indices dos expertos seleccionados para cada token, sumamos 1 para cada indice de experto seleccionado
             self.total_assigment_count.scatter_add_(0, top1_experts, ones)
 
         # results conterá os resultados finais
@@ -1210,18 +1237,32 @@ if __name__ == "__main__":
                 
         # Conteo os tokens asignados a cada experto
         layer_counts = []
+        layer_dropped_counts = []
         for block in model.module.transformer.h:
-            if hasattr(block, 'moe_layer'):
-                layer_counts.append(block.moe_layer.total_assigment_count)
-                print(block.moe_layer.total_assigment_count)
+            
+            moe = block.moe_layer
+            if hasattr(moe, 'total_assigment_count'):
+                layer_counts.append(moe.total_assigment_count.clone())
                 
-        # Promediamos os contadores de asignación de expertos entre os bloques e logo as GPUs
-        counts_blocks = torch.stack(layer_counts)
-        mean_blocks = counts_blocks.float().mean(dim=0)
-        dist.all_reduce(mean_blocks, op=dist.ReduceOp.AVG)
-        percentage = mean_blocks / (total_batch_size / ddp_world_size)
-        if master_process:
-            print(percentage)
+            if hasattr(moe, "total_dropped_count"):
+                layer_dropped_counts.append(moe.total_dropped_count.clone())
+                
+        # Promediamos os contadores de asignación de expertos e dropped tokens de habelos entre os bloques e logo as GPUs
+        mean_assignments = torch.stack(layer_counts).float().mean(dim=0)
+        if len(layer_dropped_counts) > 0:
+            mean_dropped = torch.stack(layer_dropped_counts).float().mean().unsqueeze(0)
+        
+        if ddp:
+            dist.all_reduce(mean_assignments, op=dist.ReduceOp.AVG)
+            if len(layer_dropped_counts) > 0:
+                dist.all_reduce(mean_dropped, op=dist.ReduceOp.AVG)
+           
+        # Definimos as porcentaxes para mostralas nas métricas     
+        assigment_percentage = mean_assignments / (total_batch_size / ddp_world_size)
+        if len(layer_dropped_counts) > 0:
+            dropped_percentage = mean_dropped / (total_batch_size / ddp_world_size)
+        else:
+            dropped_percentage = 0
         # ------------------------------------------
         
         

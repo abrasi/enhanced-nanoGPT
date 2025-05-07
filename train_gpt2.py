@@ -203,7 +203,7 @@ class GShardMoE(nn.Module):
         # Bias de DeepSeek
         self.bias = nn.Parameter(torch.empty(self.n_experts)) if config.bias else None
         
-        self.register_buffer("total_assigment_count", torch.zeros(self.n_paths, dtype=torch.long))
+        self.register_buffer("total_assigment_count", torch.zeros(self.n_experts, dtype=torch.long))
         self.register_buffer("total_dropped_count", torch.tensor(0, dtype=torch.long))
         
         # Capacidade dos expertos
@@ -222,6 +222,11 @@ class GShardMoE(nn.Module):
         self.load_loss = 0.0
         self.z_loss = 0.0
         self.penalty = 0.0
+        
+    @torch.no_grad()
+    def reset_stats(self):
+        self.total_assigment_count.zero_()
+        self.total_dropped_count.zero_()
         
     def get_load_balance_loss(self, router_probs, expert_onehot):
         
@@ -260,8 +265,6 @@ class GShardMoE(nn.Module):
         
         auxiliar_loss = 0.0
 
-        B, T, C = x.shape
-        S = B * T
         x_squashed = x.view(-1, x.shape[-1])
         
         router_logits = self.gate(x_squashed)
@@ -290,49 +293,40 @@ class GShardMoE(nn.Module):
         
         g1_normalized = g1 / (g1 + g2)
         g2_normalized = g2 / (g1 + g2)
+                
+        top1_onehot = F.one_hot(e1, self.n_experts)
+        top1_cumsum = torch.cumsum(top1_onehot, dim=0)
+        top1_capacity_mask = top1_cumsum <= self.expert_capacity
         
-        # Contar os tokens asignados a cada experto
-        c_e1 = torch.zeros(self.n_experts, dtype=torch.long, device=x.device)
-        c_e2 = torch.zeros(self.n_experts, dtype=torch.long, device=x.device)
-        
-        G = torch.zeros(S, self.n_experts, device=x.device)
-        expert_onehot = torch.zeros_like(G)
-        
-        # Asignación al top-1 (e1)
-        for i in range(S):
-            expert = e1[i].item()
-            if c_e1[expert] < self.expert_capacity:
-                G[i, expert] += g1_normalized[i]
-            expert_onehot[i, expert] = 1
-            c_e1[expert] += 1
+        # Almacenamos os pesos dos top-1 expertos que non cubriron a súa capacidade
+        G = g1_normalized.unsqueeze(1) * top1_onehot * top1_capacity_mask
                 
         # Calcular pérdida auxiliar
         if self.w_load > 0:
-            self.load_loss = self.get_load_balance_loss(probs, expert_onehot)
+            self.load_loss = self.get_load_balance_loss(probs, top1_onehot)
             auxiliar_loss += self.load_loss
 
-        # Asignación ao top2 estocástico
-        rand_vals = torch.rand(S, device=x.device)
-        for i in range(S):
-            expert = e2[i].item()
-            if c_e2[expert] < self.expert_capacity and 2 * g2_normalized[i] > rand_vals[i]:
-                G[i, expert] += g2_normalized[i]
-            c_e2[expert] += 1
+        # top‑2 estocástico -----------------------
+        top2_onehot = F.one_hot(e2, self.n_experts)
+        rnd = torch.rand_like(g2_normalized)
+        top2_cumsum = torch.cumsum(top2_onehot, dim=0)
+        top2_capacity_mask = top2_cumsum <= self.expert_capacity
+        top2_stochastic_mask = (rnd < 2 * g2_normalized).unsqueeze(1)
+
+        # Almacenamos os pesos dos top-2 expertos que non cubriron a súa capacidade
+        G += g2_normalized.unsqueeze(1) * top2_onehot * (top2_capacity_mask & top2_stochastic_mask)
             
         if self.w_importance > 0:
-            self.importance_loss = self.get_importance_loss()
+            self.importance_loss = self.get_importance_loss(G)
             auxiliar_loss += self.importance_loss
             
         with torch.no_grad():
-            top1_experts = e1.view(-1)
-            ones = torch.ones_like(top1_experts, dtype=torch.long)
-            # top1_experts contén os indices dos expertos seleccionados para cada token, sumamos 1 para cada indice de experto seleccionado
-            self.total_assigment_count.scatter_add_(0, top1_experts, ones)
+            self.total_assigment_count += top1_onehot.sum(dim=0)
             
             dropped_tokens = (G.sum(dim=-1) == 0)
             self.total_dropped_count += dropped_tokens.sum()
             
-        y_flat = torch.zeros(S, C, device=x.device)
+        y_flat = torch.zeros_like(x_squashed)
 
         for e in range(self.n_experts):
             token_ids = torch.nonzero(G[:, e], as_tuple=False).squeeze(-1)
@@ -737,7 +731,7 @@ class GPTConfig:
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
     
-    expert_implementation: str = "OLNNMoE"  # GShardMoE | SwitchMoE | OLNNMoE | CondMLP
+    expert_implementation: str = "GShardMoE"  # GShardMoE | SwitchMoE | OLNNMoE | CondMLP
     n_experts: int = 4
     topk: int = 2
     expert_capacity: int = 1536 # = expert_capacity =  (B*T / n_experts) * capacity_factor = 1.5, usamos T en vez de B*T por la forma en que se hace forward en SwitchMoE
@@ -1068,7 +1062,7 @@ if __name__ == "__main__":
     model = GPT(GPTConfig(vocab_size=50304))
     # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
     model.to(device)
-    use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+    use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
     if use_compile:
         model = torch.compile(model)
     if ddp:
@@ -1279,9 +1273,12 @@ if __name__ == "__main__":
         num_layers = len(model.module.transformer.h)
         for k in aux_losses:
             aux_losses[k] /= (grad_accum_steps * num_layers)
-            aux_losses[k] = torch.tensor(aux_losses[k], device=device)
+            if not torch.is_tensor(aux_losses[k]):
+                aux_losses[k] = torch.tensor(aux_losses[k], device=device)
+            else:
+                aux_losses[k] = aux_losses[k].to(device)
 
-        if ddp and dist.is_initialized():
+        if ddp:
             for v in aux_losses.values():
                 dist.all_reduce(v, op=dist.ReduceOp.AVG)
 

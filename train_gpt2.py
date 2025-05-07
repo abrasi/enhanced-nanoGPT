@@ -101,8 +101,8 @@ class CondMLP(nn.Module):
         penalty_b = (1. / self.n_paths - torch.mean(prob_mean * (1. - prob_mean)))
         return penalty_a + penalty_b
  
-    def get_z_loss(self, router_logits):
-        logsumexp = torch.logsumexp(router_logits, dim=-1)
+    def get_z_loss(self, gate_logits):
+        logsumexp = torch.logsumexp(gate_logits, dim=-1)
         loss = torch.mean(logsumexp ** 2)
         return self.lambda_z * loss
            
@@ -149,7 +149,7 @@ class CondMLP(nn.Module):
 
     def forward(self, x):
         
-        auxiliar_loss = 0.0
+        auxiliary_loss = 0.0
         
         guess = self.guesser(x)
         
@@ -158,7 +158,7 @@ class CondMLP(nn.Module):
         
         if self.lambda_z > 0:
             self.z_loss = self.get_z_loss(guess)
-            auxiliar_loss += self.z_loss
+            auxiliary_loss += self.z_loss
         
         prob = torch.softmax(guess / 1.66, dim=-1)
         selection = self.__get_selection(prob)
@@ -169,11 +169,11 @@ class CondMLP(nn.Module):
         
         if self.w_load > 0:
             self.load_loss = self.get_load_balance_loss(prob, selection)
-            auxiliar_loss += self.load_loss
+            auxiliary_loss += self.load_loss
             
         if self.w_importance > 0:
             self.importance_loss = self.get_importance_loss(prob, selection)
-            auxiliar_loss += self.importance_loss
+            auxiliary_loss += self.importance_loss
         
         x2 = self.c_fc(x) + self.b_fc(selection)
         x2 = self.gelu(x2)
@@ -181,10 +181,10 @@ class CondMLP(nn.Module):
         
         if self.w_penalty > 0:
             self.penalty = self.w_penalty * self.__get_penalty(prob)
-            auxiliar_loss += self.penalty
+            auxiliary_loss += self.penalty
         
         
-        return x2 + x, auxiliar_loss
+        return x2, auxiliary_loss
      
     
 class GShardMoE(nn.Module):
@@ -243,8 +243,8 @@ class GShardMoE(nn.Module):
         cv_squared = var / (mean ** 2)  # evitar división por 0
         return self.w_importance * cv_squared
         
-    def get_z_loss(self, router_logits):
-        logsumexp = torch.logsumexp(router_logits, dim=-1)
+    def get_z_loss(self, gate_logits):
+        logsumexp = torch.logsumexp(gate_logits, dim=-1)
         loss = torch.mean(logsumexp ** 2)
         return self.lambda_z * loss
            
@@ -263,25 +263,25 @@ class GShardMoE(nn.Module):
         
     def forward(self, x):
         
-        auxiliar_loss = 0.0
+        auxiliary_loss = 0.0
 
         x_squashed = x.view(-1, x.shape[-1])
         
-        router_logits = self.gate(x_squashed)
+        gate_logits = self.gate(x_squashed)
         
         if self.bias is not None:
-            router_logits += self.bias
+            gate_logits += self.bias
             
         if self.w_penalty > 0:
-            self.penalty = self.w_penalty * self.get_penalty(router_logits)
-            auxiliar_loss += self.penalty
+            self.penalty = self.w_penalty * self.get_penalty(gate_logits)
+            auxiliary_loss += self.penalty
             
         if self.lambda_z > 0:
-            self.z_loss = self.get_z_loss(router_logits)
-            auxiliar_loss += self.z_loss
+            self.z_loss = self.get_z_loss(gate_logits)
+            auxiliary_loss += self.z_loss
         
         probs = F.softmax(
-            router_logits,
+            gate_logits,
             dim=-1,
             dtype=torch.float,
         ).type_as(x)
@@ -304,7 +304,7 @@ class GShardMoE(nn.Module):
         # Calcular pérdida auxiliar
         if self.w_load > 0:
             self.load_loss = self.get_load_balance_loss(probs, top1_onehot)
-            auxiliar_loss += self.load_loss
+            auxiliary_loss += self.load_loss
 
         # top‑2 estocástico -----------------------
         top2_onehot = F.one_hot(e2, self.n_experts)
@@ -318,7 +318,7 @@ class GShardMoE(nn.Module):
             
         if self.w_importance > 0:
             self.importance_loss = self.get_importance_loss(G)
-            auxiliar_loss += self.importance_loss
+            auxiliary_loss += self.importance_loss
             
         with torch.no_grad():
             self.total_assigment_count += top1_onehot.sum(dim=0)
@@ -341,7 +341,7 @@ class GShardMoE(nn.Module):
 
         y = y_flat.view_as(x)
         
-        return y, auxiliar_loss
+        return y, auxiliary_loss
 
         
 class SwitchMoE(nn.Module): 
@@ -385,9 +385,9 @@ class SwitchMoE(nn.Module):
         self.total_assigment_count.zero_()
         self.total_dropped_count.zero_()
              
-    def get_z_loss(self, router_logits):
+    def get_z_loss(self, gate_logits):
         
-        logsumexp = torch.logsumexp(router_logits, dim=-1)
+        logsumexp = torch.logsumexp(gate_logits, dim=-1)
         loss = torch.mean(logsumexp ** 2)
         return self.lambda_z * loss
           
@@ -441,28 +441,28 @@ class SwitchMoE(nn.Module):
     
     def route(self, x):
         
-        auxiliar_loss = 0.0
+        auxiliary_loss = 0.0
         
         B, T, C = x.shape
         
         x_flat = x.view(B*T, C)
         
-        router_logits = self.gate(x_flat)
+        gate_logits = self.gate(x_flat)
         
         # Engadimos o bias de DeepSeek
         if self.bias is not None:
             gate_logits += self.bias
         
         if self.w_penalty > 0:
-            self.penalty = self.w_penalty * self.get_penalty(router_logits)
-            auxiliar_loss += self.penalty
+            self.penalty = self.w_penalty * self.get_penalty(gate_logits)
+            auxiliary_loss += self.penalty
         
         if self.lambda_z > 0:
-            self.z_loss = self.get_z_loss(router_logits)
-            auxiliar_loss += self.z_loss
+            self.z_loss = self.get_z_loss(gate_logits)
+            auxiliary_loss += self.z_loss
         
         router_probs = F.softmax(
-            router_logits,
+            gate_logits,
             dim=-1,
             dtype=torch.float,
         ).type_as(x)
@@ -470,14 +470,14 @@ class SwitchMoE(nn.Module):
         top1_weight, top1_idx = torch.max(router_probs, dim=-1)
         
         # Tensores onehot para os expertos top1 seleccionados
-        top1_expert_mask = F.one_hot(top1_idx, num_classes=self.n_experts)
+        top1_onehot = F.one_hot(top1_idx, num_classes=self.n_experts)
         
         # Mascara para a capacidade dos expertos
-        token_priority = torch.cumsum(top1_expert_mask, dim=0)
+        token_priority = torch.cumsum(top1_onehot, dim=0)
         expert_capacity_mask = token_priority <= self.expert_capacity
 
         # Multiplicamos pola máscara de capacidade para descartar os tokens que fan overflow
-        expert_index = top1_expert_mask * expert_capacity_mask
+        expert_index = top1_onehot * expert_capacity_mask
         
         with torch.no_grad():
             # Rexistramos as asignacións dos expertos e os dropped tokens
@@ -490,26 +490,25 @@ class SwitchMoE(nn.Module):
         # Pérdidas auxiliares
         if self.w_load > 0:
             # No paper de Switch Transformer non se especifica se o loss calculase coas asignacións REAIS, contando co expert capacity, ou se cos intentos de asignacións do Gate, déixase igual que en GShard
-            self.load_loss = self.get_load_balance_loss(router_probs, top1_expert_mask)
-            auxiliar_loss += self.load_loss
+            self.load_loss = self.get_load_balance_loss(router_probs, top1_onehot)
+            auxiliary_loss += self.load_loss
             
         if self.w_importance > 0:
-            self.importance_loss = self.get_importance_loss(top1_weight, top1_idx)
-            auxiliar_loss += self.importance_loss
+            self.importance_loss = self.get_importance_loss(top1_weight.unsqueeze(1), top1_idx.unsqueeze(1))
+            auxiliary_loss += self.importance_loss
             
         router_probs = torch.max(router_probs, dim=-1).values.unsqueeze(-1)
 
-        return expert_index, router_probs, self.load_loss + self.z_loss + self.penalty + self.importance_loss, x_flat, B, T
+        return expert_index, router_probs, auxiliary_loss, x_flat, B, T
          
     def forward(self, x):
         
         expert_index, router_probs, auxiliary_loss, x_flat, B, T = self.route(x)
         
         # Indices de los expertos seleccionados
-        # expert_index = torch.argmax(router_mask, dim=-1)
         
-        # Clonamos las entradas porque hay tokens que no se procesarán -> Dropped tokens
-        next_states = x_flat.clone()
+        # Inicializamos as saídas a 0 para os dropped tokens
+        next_states = torch.zeros_like(x_flat)
         
         for idx in range(self.n_experts):
             
@@ -522,9 +521,9 @@ class SwitchMoE(nn.Module):
             
         # La salida se multiplica por la probabilidad de cada experto
         # Duda: tiene sentido multiplicar por la probabilidad de cada experto si hay tokens que no se envían a ningún experto?
-        x = router_probs * next_states
+        x2 = router_probs * next_states
         
-        return x, auxiliary_loss
+        return x2, auxiliary_loss
 
 
 class OLNNMoE(nn.Module):
@@ -697,7 +696,7 @@ class OLNNMoE(nn.Module):
                 results[batch_idx] += weights[batch_idx, nth_expert, None] * expert_logits
                         
         # Devolvemos á forma orixinal das entradas e retornamos as perdas auxiliares
-        return results.view_as(x), self.penalty
+        return results.view_as(x), auxiliary_loss
         
 
 class Block(nn.Module):

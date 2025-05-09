@@ -25,31 +25,22 @@ pattern = re.compile(r"(\d+) train ce ([\d.]+)")
 
 with open(log_file, "r") as f:
     for line in f:
-        # train_match = train_pattern.search(line)
-        # expert_match = expert_pattern.search(line)
+        # Buscar train ce
         match = pattern.search(line)
         if match:
             step = int(match.group(1))
             train_loss = float(match.group(2))
-            # importance_loss = float(match.group(3))
-            load_loss = float(match.group(4))
-            expert_values = list(map(float, match.group(5).split(',')))
-            
             steps_train.append(step)
             train_losses.append(train_loss)
-            # importance_losses.append(importance_loss)
-            load_losses.append(load_loss)
-            expert_assignments.append(expert_values)
         
-        parts = line.strip().split(',', maxsplit=1)
-        meta_info = parts[0].split()
-        epoch, loss_type, loss_value = meta_info[:3]
-        epoch = int(epoch)
-        loss_value = float(loss_value)
+        # Buscar val
+        elif "val" in line:
+            parts = line.strip().split()
+            step = int(parts[0])
+            val_loss = float(parts[2])
+            steps_val.append(step)
+            val_losses.append(val_loss)
         
-        if loss_type == "val":
-            val_losses.append(loss_value)
-            steps_val.append(epoch)
 
 # Convertir listas a arrays para graficar
 train_losses = np.array(train_losses)

@@ -730,16 +730,16 @@ class GPTConfig:
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
     
-    expert_implementation: str = "GShardMoE"  # GShardMoE | SwitchMoE | OLNNMoE | CondMLP
+    expert_implementation: str = "OLNNMoE"  # GShardMoE | SwitchMoE | OLNNMoE | CondMLP
     n_experts: int = 4
     topk: int = 2
-    expert_capacity: int = 1536 # = expert_capacity =  (B*T / n_experts) * capacity_factor = 1.5, usamos T en vez de B*T por la forma en que se hace forward en SwitchMoE
+    expert_capacity: int = 1536 # = expert_capacity =  (B*T / n_experts) * capacity_factor = 1.5
 
-    w_importance: float = 0.1
-    w_load: float = 0.1
-    lambda_z: float = 0.1
-    w_penalty: float = 0.1
-    bias: bool = True
+    w_importance: float = 0
+    w_load: float = 0
+    lambda_z: float = 0
+    w_penalty: float = 0
+    bias: bool = False
 
 class GPT(nn.Module):
 

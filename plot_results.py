@@ -20,7 +20,7 @@ expert_assignments = []
 
 # train_pattern = re.compile(r"(\d+) train ([\d.]+).+dropped tokens: [\d.]+ \((\d+.\d+)%\)")
 # expert_pattern = re.compile(r"expert assigment percentage: \[([\d., ]+)\]")
-pattern = re.compile(r"(\d+) train ([\d.]+), load loss ([\d.e-]+) expert assigment percentage: \[([\d., ]+)\]")
+pattern = re.compile(r"(\d+) train ce ([\d.]+)")
 
 
 with open(log_file, "r") as f:
@@ -90,14 +90,14 @@ plt.show()
 # plt.show()
 
 # Load loss
-plt.figure(figsize=(10, 5))
-plt.plot(steps_train, load_losses, label="Load Loss", color='green')
-plt.xlabel("Epochs")
-plt.ylabel("Loss")
-plt.title("Load Loss Evolution")
-plt.legend()
-plt.grid()
-plt.show()
+# plt.figure(figsize=(10, 5))
+# plt.plot(steps_train, load_losses, label="Load Loss", color='green')
+# plt.xlabel("Epochs")
+# plt.ylabel("Loss")
+# plt.title("Load Loss Evolution")
+# plt.legend()
+# plt.grid()
+# plt.show()
 
 # Gráfico de dropped tokens
 # plt.figure(figsize=(10, 5))
@@ -110,14 +110,14 @@ plt.show()
 # plt.show()
 
 # Gráfico de asignación a expertos con stacked area plot
-plt.figure(figsize=(10, 5))
-plt.stackplot(steps_train, expert_assignments.T, labels=[f"Expert {i}" for i in range(expert_assignments.shape[1])], alpha=0.7)
-plt.title("Expert Assignment Proportions")
-plt.xlabel("Epochs")
-plt.ylabel("Proportion")
-plt.legend()
-plt.grid()
-plt.show()
+# plt.figure(figsize=(10, 5))
+# plt.stackplot(steps_train, expert_assignments.T, labels=[f"Expert {i}" for i in range(expert_assignments.shape[1])], alpha=0.7)
+# plt.title("Expert Assignment Proportions")
+# plt.xlabel("Epochs")
+# plt.ylabel("Proportion")
+# plt.legend()
+# plt.grid()
+# plt.show()
 
 print(f"Minimum Train Loss: {min_train_loss:.4f} at epoch {min_train_epoch}")
 print(f"Minimum Validation Loss: {min_val_loss:.4f} at epoch {min_val_epoch}")

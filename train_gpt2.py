@@ -1101,14 +1101,11 @@ if __name__ == "__main__":
 
     # Monitorización energia de las GPUs
     monitor = ZeusMonitor(gpu_indices=[torch.cuda.current_device()])
-    steps = []
 
     monitor.begin_window("epoch")
     for step in range(max_steps):
         t0 = time.time()
         last_step = (step == max_steps - 1)
-
-        monitor.begin_window("step")
         
         # once in a while evaluate our validation loss
         if step % 250 == 0 or last_step:
@@ -1326,9 +1323,6 @@ if __name__ == "__main__":
         optimizer.step()
         if device_type == "cuda":
             torch.cuda.synchronize() # wait for the GPU to finish work
-            
-        result = monitor.end_window("step")
-        steps.append(result)
         
         t1 = time.time()
         dt = t1 - t0 # time difference in seconds
@@ -1352,19 +1346,24 @@ if __name__ == "__main__":
             print(msg)
             
             with open(log_file, "a") as f:
-                f.write(f"{step} train ce {loss_accum.item():.6f}")
+                f.write(f"{step} train {loss_accum.item():.6f}")
                 for k, v in aux_losses.items():
                     if abs(v) > 0:
                         f.write(f" {k} {v:.3e}")
                 f.write("\n")
 
     mes = monitor.end_window("epoch")
+    
+    time_h   = mes.time / 3600
+    energy_j = torch.tensor(mes.total_energy, device=device)
+    
+    if ddp:
+        dist.all_reduce(energy_j, op=dist.ReduceOp.SUM)
+    
+    energy_kwh = energy_j / 3.6e6
 
-    avg_time = sum(map(lambda m: m.time, steps)) / len(steps)
-    avg_energy = sum(map(lambda m: m.total_energy, steps)) / len(steps)
-    with open(log_file, "a") as f:
-        f.write(f"Epoch consumed {mes.time} s and {mes.total_energy} J.")
-        f.write(f"One step took {avg_energy} J on average.")
+    if master_process:
+        print(f"Epoch time: {time_h:.3f} h  |  energy: {energy_kwh:.6f} kWh")
 
     if ddp:
         destroy_process_group()

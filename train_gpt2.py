@@ -8,6 +8,22 @@ import torch.nn as nn
 from torch.nn import functional as F
 from hellaswag import render_example, iterate_examples
 from zeus.monitor import ZeusMonitor
+
+import argparse
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    
+    parser.add_argument("--w_load", type=float, default=0.0)
+    parser.add_argument("--w_importance", type=float, default=0.0)
+    parser.add_argument("--w_penalty", type=float, default=0.0)
+    parser.add_argument("--lambda_z", type=float, default=0.0)
+    parser.add_argument("--bias", type=bool, default=False)
+    
+    parser.add_argument("--moe_implementation", type=str, default="OLNNMoE")
+    parser.add_argument("--exp_name", type=str, default=None)
+    return parser.parse_args()
+
 # -----------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
@@ -706,13 +722,13 @@ class Block(nn.Module):
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        if config.expert_implementation == "OLNNMoE":
+        if config.moe_implementation == "OLNNMoE":
             self.moe_layer = OLNNMoE(config)
-        elif config.expert_implementation == "SwitchMoE":
+        elif config.moe_implementation == "SwitchMoE":
             self.moe_layer = SwitchMoE(config)
-        elif config.expert_implementation == "GShardMoE":
+        elif config.moe_implementation == "GShardMoE":
             self.moe_layer = GShardMoE(config)
-        elif config.expert_implementation == "CondMLP":
+        elif config.moe_implementation == "CondMLP":
             self.moe_layer = CondMLP(config)
 
     def forward(self, x):
@@ -730,7 +746,7 @@ class GPTConfig:
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
     
-    expert_implementation: str = "OLNNMoE"  # GShardMoE | SwitchMoE | OLNNMoE | CondMLP
+    moe_implementation: str = "OLNNMoE"  # GShardMoE | SwitchMoE | OLNNMoE | CondMLP
     n_experts: int = 4
     topk: int = 2
     expert_capacity: int = 1536 # = expert_capacity =  (B*T / n_experts) * capacity_factor = 1.5
@@ -954,6 +970,350 @@ def get_most_likely_row(tokens, mask, logits):
 
 # -----------------------------------------------------------------------------
 
+# Funcion que actuaiza el bias en cada capa MoE del modelo
+def update_moe_layer_bias(moe_layer, gamma):
+    # Sumar los tokens asignados a cada experto en esta capa
+    tokens_per_expert = moe_layer.total_assigment_count.float().to(device)
+    
+    # Recogemos los tokens de todos los nodos, cuello de botella?
+    if dist.is_initialized():
+        dist.all_reduce(tokens_per_expert, op=dist.ReduceOp.AVG)
+    
+    # Promedio local de tokens para este MoE layer
+    avg_tokens = tokens_per_expert.mean()
+    
+    # Definir umbrales locales
+    overload_threshold = avg_tokens * 1.2
+    underload_threshold = avg_tokens * 0.8
+
+    # Determinar índices de expertos sobrecargados e infracargados
+    overloaded = (tokens_per_expert > overload_threshold).nonzero(as_tuple=True)[0]
+    underloaded = (tokens_per_expert < underload_threshold).nonzero(as_tuple=True)[0]
+    
+    with torch.no_grad():
+        if overloaded.numel() > 0:
+            moe_layer.bias[overloaded] -= gamma
+        if underloaded.numel() > 0:
+            moe_layer.bias[underloaded] += gamma    
+            
+def get_lr(it, warmup_steps, max_lr, min_lr, max_steps):
+        # 1) linear warmup for warmup_iters steps
+        if it < warmup_steps:
+            return max_lr * (it+1) / warmup_steps
+        # 2) if it > lr_decay_iters, return min learning rate
+        if it > max_steps:
+            return min_lr
+        # 3) in between, use cosine decay down to min learning rate
+        decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+        return min_lr + coeff * (max_lr - min_lr)      
+
+def run_training(gptconfig: GPTConfig, log_dir):
+        # create model
+        model = GPT(gptconfig)
+        # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
+        model.to(device)
+        use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+        if use_compile:
+            model = torch.compile(model)
+        if ddp:
+            model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
+        raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
+
+        max_lr = 6e-4
+        min_lr = max_lr * 0.1
+        warmup_steps = 715
+        max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+
+        gamma = 0.001 # Hiperparametro para el ajuste del bias del Gate de MoE
+        bias_update_step = int(max_steps * 0.97) # Más o menos en DeepSeek el bias de Gating de MoE pasa a ser 0 a partir de este punto
+
+        
+
+        # optimize!
+        optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+
+        # create the log directory we will write checkpoints to and log to
+        log_file = os.path.join(log_dir, "log.txt")
+        with open(log_file, "w") as f: # open for writing to clear the file
+            pass
+
+        # Monitorización energia de las GPUs
+        monitor = ZeusMonitor(gpu_indices=[torch.cuda.current_device()])
+
+        monitor.begin_window("epoch")
+        for step in range(max_steps):
+            t0 = time.time()
+            last_step = (step == max_steps - 1)
+            
+            # once in a while evaluate our validation loss
+            if step % 250 == 0 or last_step:
+                model.eval()
+                val_loader.reset()
+                with torch.no_grad():
+                    val_loss_accum = 0.0
+                    val_loss_steps = 20
+                    for _ in range(val_loss_steps):
+                        x, y = val_loader.next_batch()
+                        x, y = x.to(device), y.to(device)
+                        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                            logits, loss = model(x, y)
+                        loss = loss / val_loss_steps
+                        val_loss_accum += loss.detach()
+                if ddp:
+                    # Aqui se promedian los losses calculados entre las GPUs
+                    dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+                if master_process:
+                    print(f"validation loss: {val_loss_accum.item():.4f}")
+                    with open(log_file, "a") as f:
+                        f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+                    if step > 0 and (step % 5000 == 0 or last_step):
+                        # optionally write model checkpoints
+                        checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                        checkpoint = {
+                            'model': raw_model.state_dict(),
+                            'config': raw_model.config,
+                            'step': step,
+                            'val_loss': val_loss_accum.item()
+                        }
+                        # you might also want to add optimizer.state_dict() and
+                        # rng seeds etc., if you wanted to more exactly resume training
+                        torch.save(checkpoint, checkpoint_path)
+
+            # once in a while evaluate hellaswag
+            if (step % 250 == 0 or last_step) and (not use_compile):
+                print("evaluating hella swag")
+                num_correct_norm = 0
+                num_total = 0
+                for i, example in enumerate(iterate_examples("val")):
+                    # only process examples where i % ddp_world_size == ddp_rank
+                    if i % ddp_world_size != ddp_rank:
+                        continue
+                    # render the example into tokens and labels
+                    _, tokens, mask, label = render_example(example)
+                    tokens = tokens.to(device)
+                    mask = mask.to(device)
+                    # get the logits
+                    with torch.no_grad():
+                        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                            logits, loss = model(tokens)
+                        pred_norm = get_most_likely_row(tokens, mask, logits)
+                    num_total += 1
+                    num_correct_norm += int(pred_norm == label)
+                # reduce the stats across all processes
+                if ddp:
+                    num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+                    num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+                    dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+                    num_total = num_total.item()
+                    num_correct_norm = num_correct_norm.item()
+                acc_norm = num_correct_norm / num_total
+                if master_process:
+                    print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+                    with open(log_file, "a") as f:
+                        f.write(f"{step} hella {acc_norm:.4f}\n")
+
+            # once in a while generate from the model (except step 0, which is noise)
+            if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
+                model.eval()
+                num_return_sequences = 4
+                max_length = 32
+                tokens = enc.encode("Hello, I'm a language model,")
+                tokens = torch.tensor(tokens, dtype=torch.long)
+                tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+                xgen = tokens.to(device)
+                sample_rng = torch.Generator(device=device)
+                sample_rng.manual_seed(42 + ddp_rank)
+                while xgen.size(1) < max_length:
+                    # forward the model to get the logits
+                    with torch.no_grad():
+                        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                            logits, loss = model(xgen) # (B, T, vocab_size)
+                        # take the logits at the last position
+                        logits = logits[:, -1, :] # (B, vocab_size)
+                        # get the probabilities
+                        probs = F.softmax(logits, dim=-1)
+                        # do top-k sampling of 50 (huggingface pipeline default)
+                        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+                        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                        # select a token from the top-k probabilities
+                        # note: multinomial does not demand the input to sum to 1
+                        ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+                        # gather the corresponding indices
+                        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+                        # append to the sequence
+                        xgen = torch.cat((xgen, xcol), dim=1)
+                # print the generated text
+                for i in range(num_return_sequences):
+                    tokens = xgen[i, :max_length].tolist()
+                    decoded = enc.decode(tokens)
+                    print(f"rank {ddp_rank} sample {i}: {decoded}")
+
+            # do one step of the optimization
+            model.train()
+            optimizer.zero_grad()
+            
+            # Actualización de bias para MoE
+            if step == bias_update_step:
+                gamma = 0.0
+                if master_process:
+                    print("Zeroed out the bias update speed in the MoE layer -> 97%% of training done")
+                    
+            if gamma > 0:
+                
+                for block in model.module.transformer.h: 
+                    if hasattr(block, 'moe_layer'): 
+                        update_moe_layer_bias(block.moe_layer, gamma)
+            #--------------------------------           
+            
+            # Reseteamos os contadores de asignación de expertos para realizar o conteo despois do gradient accumulation
+            for block in model.module.transformer.h:
+                block.moe_layer.reset_stats()
+
+            # Inicializamos os acumuladores dos losses auxiliares
+            aux_losses = {'importance_loss': 0.0, 'load_loss': 0.0, 'z_loss': 0.0, 'penalty': 0.0}
+            
+            loss_accum = 0.0
+            for micro_step in range(grad_accum_steps):
+                x, y = train_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                # added after video, this field is also used by the forward pass.
+                if ddp:
+                    model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                # we have to scale the loss to account for gradient accumulation,
+                # because the gradients just add on each successive backward().
+                # addition of gradients corresponds to a SUM in the objective, but
+                # instead of a SUM we want MEAN. Scale the loss here so it comes out right
+                loss = loss / grad_accum_steps
+                loss_accum += loss.detach()
+                
+                with torch.no_grad():
+                    for block in model.module.transformer.h:
+                        moe = block.moe_layer
+                        aux_losses['importance_loss']  += getattr(moe, 'importance_loss', 0.0)
+                        aux_losses['load_loss'] += getattr(moe, 'load_loss',       0.0)
+                        aux_losses['z_loss']    += getattr(moe, 'z_loss',          0.0)
+                        aux_losses['penalty']  += getattr(moe, 'penalty',         0.0)
+                
+                loss.backward()
+                
+            if ddp:
+                dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+                
+        
+            # Promediamos as perdas auxiliares
+            num_layers = len(model.module.transformer.h)
+            for k in aux_losses:
+                aux_losses[k] /= (grad_accum_steps * num_layers)
+                if not torch.is_tensor(aux_losses[k]):
+                    aux_losses[k] = torch.tensor(aux_losses[k], device=device)
+                else:
+                    aux_losses[k] = aux_losses[k].to(device)
+
+            if ddp:
+                for v in aux_losses.values():
+                    dist.all_reduce(v, op=dist.ReduceOp.AVG)
+
+            aux_losses = {k: v.item() for k, v in aux_losses.items()}
+            #------------------------------------
+            
+            
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # determine and set the learning rate for this iteration
+            lr = get_lr(step, warmup_steps, max_lr, min_lr, max_steps)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+                
+                    
+            # Conteo os tokens asignados a cada experto
+            layer_counts = []
+            layer_dropped_counts = []
+            for block in model.module.transformer.h:
+                
+                moe = block.moe_layer
+                if hasattr(moe, 'total_assigment_count'):
+                    layer_counts.append(moe.total_assigment_count.clone())
+                    
+                if hasattr(moe, "total_dropped_count"):
+                    layer_dropped_counts.append(moe.total_dropped_count.clone())
+                    
+            # Promediamos os contadores de asignación de expertos e dropped tokens de habelos entre os bloques e logo as GPUs
+            mean_assignments = torch.stack(layer_counts).float().mean(dim=0)
+            if len(layer_dropped_counts) > 0:
+                mean_dropped = torch.stack(layer_dropped_counts).float().mean().unsqueeze(0)
+            
+            if ddp:
+                dist.all_reduce(mean_assignments, op=dist.ReduceOp.AVG)
+                if len(layer_dropped_counts) > 0:
+                    dist.all_reduce(mean_dropped, op=dist.ReduceOp.AVG)
+            
+            # Definimos as porcentaxes para mostralas nas métricas     
+            assigment_percentage = mean_assignments / (total_batch_size / ddp_world_size)
+            if len(layer_dropped_counts) > 0:
+                dropped_percentage = mean_dropped / (total_batch_size / ddp_world_size)
+            else:
+                dropped_percentage = 0
+            # ------------------------------------------
+            
+            
+            optimizer.step()
+            if device_type == "cuda":
+                torch.cuda.synchronize() # wait for the GPU to finish work
+            
+            t1 = time.time()
+            dt = t1 - t0 # time difference in seconds
+            tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+            tokens_per_sec = tokens_processed / dt
+            if master_process:
+                
+                parts = [
+                    "{k} {v:.3e}".format(k=k, v=v)
+                    for k, v in aux_losses.items()
+                    if abs(v) > 0
+                ]            
+                loss_str = " | ".join(parts)
+                msg = (f"step {step:5d} | loss: {loss_accum.item():.6f} "
+                        f"| lr {lr:.4e} | norm: {norm:.4f} "
+                        f"| dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+                
+                if loss_str:
+                    msg += " | " + loss_str
+                    
+                print(msg)
+                
+                with open(log_file, "a") as f:
+                    f.write(f"{step} train {loss_accum.item():.6f}")
+                    for k, v in aux_losses.items():
+                        if abs(v) > 0:
+                            f.write(f" {k} {v:.3e}")
+                    f.write(f" expert_assignment_percentage {assigment_percentage.tolist()}")
+                    if len(layer_dropped_counts) > 0:
+                        f.write(f" dropped_percentage {dropped_percentage.item()*100:.2f}%")
+                    f.write("\n")
+
+        mes = monitor.end_window("epoch")
+        
+        time_h   = mes.time / 3600
+        energy_j = torch.tensor(mes.total_energy, device=device)
+        
+        if ddp:
+            dist.all_reduce(energy_j, op=dist.ReduceOp.SUM)
+        
+        energy_kwh = energy_j / 3.6e6
+
+        if master_process:
+            print(f"Epoch time: {time_h:.3f} h  |  energy: {energy_kwh:.6f} kWh")
+            with open(log_file, "a") as f:
+                f.write(f"Epoch time: {time_h:.3f} h  |  energy: {energy_kwh:.6f} kWh\n")
+
+        if ddp:
+            destroy_process_group()
+
+
 if __name__ == "__main__":
     
     # simple launch:
@@ -1018,352 +1378,20 @@ if __name__ == "__main__":
     val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
     torch.set_float32_matmul_precision('high') # BF16?
-
-    # Funcion que actuaiza el bias en cada capa MoE del modelo
-    def update_moe_layer_bias(moe_layer, gamma):
-        # Sumar los tokens asignados a cada experto en esta capa
-        tokens_per_expert = moe_layer.total_assigment_count.float().to(device)
-        
-        # Recogemos los tokens de todos los expertos
-        if dist.is_initialized():
-            dist.all_reduce(tokens_per_expert, op=dist.ReduceOp.AVG)
-        
-        # Promedio local de tokens para este MoE layer
-        avg_tokens = tokens_per_expert.mean()
-        
-        # Definir umbrales locales
-        overload_threshold = avg_tokens * 1.2
-        underload_threshold = avg_tokens * 0.8
-
-        # Determinar índices de expertos sobrecargados e infracargados
-        overloaded = (tokens_per_expert > overload_threshold).nonzero(as_tuple=True)[0]
-        underloaded = (tokens_per_expert < underload_threshold).nonzero(as_tuple=True)[0]
-        
-        with torch.no_grad():
-            if overloaded.numel() > 0:
-                moe_layer.bias[overloaded] -= gamma
-            if underloaded.numel() > 0:
-                moe_layer.bias[underloaded] += gamma
-
-
-    def get_auxiliary_losses():
-        # importance_loss = []
-        load_loss = []
-        for block in model.module.transformer.h:
-            
-            if hasattr(block, 'moe_layer') and hasattr(block.moe_layer, 'load_loss'):
-                # importance_loss.append(block.moe_layer.importance_loss.item())
-                load_loss.append(block.moe_layer.load_loss.item())
-            
-            return None, torch.tensor(load_loss).mean().item()            
-
-    # create model
-    model = GPT(GPTConfig(vocab_size=50304))
-    # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
-    model.to(device)
-    use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
-    if use_compile:
-        model = torch.compile(model)
-    if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
-    raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
-
-    max_lr = 6e-4
-    min_lr = max_lr * 0.1
-    warmup_steps = 715
-    max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
-
-    gamma = 0.001 # Hiperparametro para el ajuste del bias del Gate de MoE
-    bias_update_step = int(max_steps * 0.97) # Más o menos en DeepSeek el bias de Gating de MoE pasa a ser 0 a partir de este punto
-
-    def get_lr(it):
-        # 1) linear warmup for warmup_iters steps
-        if it < warmup_steps:
-            return max_lr * (it+1) / warmup_steps
-        # 2) if it > lr_decay_iters, return min learning rate
-        if it > max_steps:
-            return min_lr
-        # 3) in between, use cosine decay down to min learning rate
-        decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-        assert 0 <= decay_ratio <= 1
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
-        return min_lr + coeff * (max_lr - min_lr)
-
-    # optimize!
-    optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
-
-    # create the log directory we will write checkpoints to and log to
-    log_dir = "log"
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f"log.txt")
-    with open(log_file, "w") as f: # open for writing to clear the file
-        pass
-
-    # Monitorización energia de las GPUs
-    monitor = ZeusMonitor(gpu_indices=[torch.cuda.current_device()])
-
-    monitor.begin_window("epoch")
-    for step in range(max_steps):
-        t0 = time.time()
-        last_step = (step == max_steps - 1)
-        
-        # once in a while evaluate our validation loss
-        if step % 250 == 0 or last_step:
-            model.eval()
-            val_loader.reset()
-            with torch.no_grad():
-                val_loss_accum = 0.0
-                val_loss_steps = 20
-                for _ in range(val_loss_steps):
-                    x, y = val_loader.next_batch()
-                    x, y = x.to(device), y.to(device)
-                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits, loss = model(x, y)
-                    loss = loss / val_loss_steps
-                    val_loss_accum += loss.detach()
-            if ddp:
-                # Aqui se promedian los losses calculados entre las GPUs
-                dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-            if master_process:
-                print(f"validation loss: {val_loss_accum.item():.4f}")
-                with open(log_file, "a") as f:
-                    f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-                if step > 0 and (step % 5000 == 0 or last_step):
-                    # optionally write model checkpoints
-                    checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
-                    checkpoint = {
-                        'model': raw_model.state_dict(),
-                        'config': raw_model.config,
-                        'step': step,
-                        'val_loss': val_loss_accum.item()
-                    }
-                    # you might also want to add optimizer.state_dict() and
-                    # rng seeds etc., if you wanted to more exactly resume training
-                    torch.save(checkpoint, checkpoint_path)
-
-        # once in a while evaluate hellaswag
-        if (step % 250 == 0 or last_step) and (not use_compile):
-            print("evaluating hella swag")
-            num_correct_norm = 0
-            num_total = 0
-            for i, example in enumerate(iterate_examples("val")):
-                # only process examples where i % ddp_world_size == ddp_rank
-                if i % ddp_world_size != ddp_rank:
-                    continue
-                # render the example into tokens and labels
-                _, tokens, mask, label = render_example(example)
-                tokens = tokens.to(device)
-                mask = mask.to(device)
-                # get the logits
-                with torch.no_grad():
-                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits, loss = model(tokens)
-                    pred_norm = get_most_likely_row(tokens, mask, logits)
-                num_total += 1
-                num_correct_norm += int(pred_norm == label)
-            # reduce the stats across all processes
-            if ddp:
-                num_total = torch.tensor(num_total, dtype=torch.long, device=device)
-                num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
-                dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
-                dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
-                num_total = num_total.item()
-                num_correct_norm = num_correct_norm.item()
-            acc_norm = num_correct_norm / num_total
-            if master_process:
-                print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
-                with open(log_file, "a") as f:
-                    f.write(f"{step} hella {acc_norm:.4f}\n")
-
-        # once in a while generate from the model (except step 0, which is noise)
-        if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
-            model.eval()
-            num_return_sequences = 4
-            max_length = 32
-            tokens = enc.encode("Hello, I'm a language model,")
-            tokens = torch.tensor(tokens, dtype=torch.long)
-            tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-            xgen = tokens.to(device)
-            sample_rng = torch.Generator(device=device)
-            sample_rng.manual_seed(42 + ddp_rank)
-            while xgen.size(1) < max_length:
-                # forward the model to get the logits
-                with torch.no_grad():
-                    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                        logits, loss = model(xgen) # (B, T, vocab_size)
-                    # take the logits at the last position
-                    logits = logits[:, -1, :] # (B, vocab_size)
-                    # get the probabilities
-                    probs = F.softmax(logits, dim=-1)
-                    # do top-k sampling of 50 (huggingface pipeline default)
-                    # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-                    topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-                    # select a token from the top-k probabilities
-                    # note: multinomial does not demand the input to sum to 1
-                    ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
-                    # gather the corresponding indices
-                    xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-                    # append to the sequence
-                    xgen = torch.cat((xgen, xcol), dim=1)
-            # print the generated text
-            for i in range(num_return_sequences):
-                tokens = xgen[i, :max_length].tolist()
-                decoded = enc.decode(tokens)
-                print(f"rank {ddp_rank} sample {i}: {decoded}")
-
-        # do one step of the optimization
-        model.train()
-        optimizer.zero_grad()
-        
-        # Actualización de bias para MoE
-        # if step == bias_update_step:
-        #     gamma = 0.0
-        #     if master_process:
-        #         print("Zeroed out the bias update speed in the MoE layer -> 97% of training done")
-                
-        # if gamma > 0:
-            
-        #     for block in model.module.transformer.h: 
-        #         if hasattr(block, 'moe_layer'): 
-        #             update_moe_layer_bias(dist, device, block.moe_layer, gamma)
-        #--------------------------------           
-        
-        # Reseteamos os contadores de asignación de expertos para realizar o conteo despois do gradient accumulation
-        for block in model.module.transformer.h:
-            block.moe_layer.reset_stats()
-
-        # Inicializamos os acumuladores dos losses auxiliares
-        aux_losses = {'importance_loss': 0.0, 'load_loss': 0.0, 'z_loss': 0.0, 'penalty': 0.0}
-        
-        loss_accum = 0.0
-        for micro_step in range(grad_accum_steps):
-            x, y = train_loader.next_batch()
-            x, y = x.to(device), y.to(device)
-            # added after video, this field is also used by the forward pass.
-            if ddp:
-                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-            with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                logits, loss = model(x, y)
-            # we have to scale the loss to account for gradient accumulation,
-            # because the gradients just add on each successive backward().
-            # addition of gradients corresponds to a SUM in the objective, but
-            # instead of a SUM we want MEAN. Scale the loss here so it comes out right
-            loss = loss / grad_accum_steps
-            loss_accum += loss.detach()
-            
-            with torch.no_grad():
-                for block in model.module.transformer.h:
-                    moe = block.moe_layer
-                    aux_losses['importance_loss']  += getattr(moe, 'importance_loss', 0.0)
-                    aux_losses['load_loss'] += getattr(moe, 'load_loss',       0.0)
-                    aux_losses['z_loss']    += getattr(moe, 'z_loss',          0.0)
-                    aux_losses['penalty']  += getattr(moe, 'penalty',         0.0)
-            
-            loss.backward()
-            
-        if ddp:
-            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-            
     
-        # Promediamos as perdas auxiliares
-        num_layers = len(model.module.transformer.h)
-        for k in aux_losses:
-            aux_losses[k] /= (grad_accum_steps * num_layers)
-            if not torch.is_tensor(aux_losses[k]):
-                aux_losses[k] = torch.tensor(aux_losses[k], device=device)
-            else:
-                aux_losses[k] = aux_losses[k].to(device)
-
-        if ddp:
-            for v in aux_losses.values():
-                dist.all_reduce(v, op=dist.ReduceOp.AVG)
-
-        aux_losses = {k: v.item() for k, v in aux_losses.items()}
-        #------------------------------------
-        
-        
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        # determine and set the learning rate for this iteration
-        lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-            
-                
-        # Conteo os tokens asignados a cada experto
-        layer_counts = []
-        layer_dropped_counts = []
-        for block in model.module.transformer.h:
-            
-            moe = block.moe_layer
-            if hasattr(moe, 'total_assigment_count'):
-                layer_counts.append(moe.total_assigment_count.clone())
-                
-            if hasattr(moe, "total_dropped_count"):
-                layer_dropped_counts.append(moe.total_dropped_count.clone())
-                
-        # Promediamos os contadores de asignación de expertos e dropped tokens de habelos entre os bloques e logo as GPUs
-        mean_assignments = torch.stack(layer_counts).float().mean(dim=0)
-        if len(layer_dropped_counts) > 0:
-            mean_dropped = torch.stack(layer_dropped_counts).float().mean().unsqueeze(0)
-        
-        if ddp:
-            dist.all_reduce(mean_assignments, op=dist.ReduceOp.AVG)
-            if len(layer_dropped_counts) > 0:
-                dist.all_reduce(mean_dropped, op=dist.ReduceOp.AVG)
-           
-        # Definimos as porcentaxes para mostralas nas métricas     
-        assigment_percentage = mean_assignments / (total_batch_size / ddp_world_size)
-        if len(layer_dropped_counts) > 0:
-            dropped_percentage = mean_dropped / (total_batch_size / ddp_world_size)
-        else:
-            dropped_percentage = 0
-        # ------------------------------------------
-        
-        
-        optimizer.step()
-        if device_type == "cuda":
-            torch.cuda.synchronize() # wait for the GPU to finish work
-        
-        t1 = time.time()
-        dt = t1 - t0 # time difference in seconds
-        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
-        tokens_per_sec = tokens_processed / dt
-        if master_process:
-            
-            parts = [
-                "{k} {v:.3e}".format(k=k, v=v)
-                for k, v in aux_losses.items()
-                if abs(v) > 0
-            ]            
-            loss_str = " | ".join(parts)
-            msg = (f"step {step:5d} | loss: {loss_accum.item():.6f} "
-                    f"| lr {lr:.4e} | norm: {norm:.4f} "
-                    f"| dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-            
-            if loss_str:
-                msg += " | " + loss_str
-                
-            print(msg)
-            
-            with open(log_file, "a") as f:
-                f.write(f"{step} train {loss_accum.item():.6f}")
-                for k, v in aux_losses.items():
-                    if abs(v) > 0:
-                        f.write(f" {k} {v:.3e}")
-                f.write("\n")
-
-    mes = monitor.end_window("epoch")
+    args = parse_args()
     
-    time_h   = mes.time / 3600
-    energy_j = torch.tensor(mes.total_energy, device=device)
+    config = GPTConfig(
+        vocab_size=50304,
+        w_load=args.w_load,
+        w_importance=args.w_importance,
+        w_penalty=args.w_penalty,
+        lambda_z=args.lambda_z,
+        bias=args.bias,
+        moe_implementation=args.moe_implementation,
+    )
     
-    if ddp:
-        dist.all_reduce(energy_j, op=dist.ReduceOp.SUM)
+    exp_name = args.exp_name or f"{args.moe_implementation}_load{args.w_load}_imp{args.w_importance}"
+    log_dir  = os.path.join("log", exp_name)
     
-    energy_kwh = energy_j / 3.6e6
-
-    if master_process:
-        print(f"Epoch time: {time_h:.3f} h  |  energy: {energy_kwh:.6f} kWh")
-
-    if ddp:
-        destroy_process_group()
+    run_training(config, log_dir)

@@ -2,17 +2,14 @@ import subprocess
 import os
 
 experiments = [
-    {"w_load": 0.0, "w_importance": 0.0, "w_penalty": 0.0, "lambda_z": 0.0, "bias": True, "impl": "OLNNMoE"},
-    {"w_load": 0.0,  "w_importance": 0.1, "w_penalty": 0.0, "lambda_z": 0.0, "bias": False, "impl": "SwitchMoE"},
-    {"w_load": 0.1,  "w_importance": 0.0, "w_penalty": 0.0, "lambda_z": 0.0, "bias": False, "impl": "SwitchMoE"},
-    {"w_load": 0.0,  "w_importance": 0.0, "w_penalty": 0.0, "lambda_z": 0.1, "bias": False, "impl": "SwitchMoE"},
-    {"w_load": 0.0,  "w_importance": 0.0, "w_penalty": 0.1, "lambda_z": 0.0, "bias": False, "impl": "SwitchMoE"},
-    {"w_load": 0.0,  "w_importance": 0.0, "w_penalty": 0.0, "lambda_z": 0.0, "bias": True, "impl": "SwitchMoE"},
-
+    {"w_load": 0.0,  "w_importance": 0.0, "w_penalty": 0.0, "lambda_z": 0.0, "bias": "", "impl": "SwitchMoE"},
+    {"w_load": 0.0,  "w_importance": 0.0, "w_penalty": 0.0, "lambda_z": 0.0, "bias": "", "impl": "CondMLP"},
+    {"w_load": 0.0,  "w_importance": 0.0, "w_penalty": 0.0, "lambda_z": 0.0, "bias": "", "impl": "GShardMoE"},
+    {"w_load": 0.0,  "w_importance": 0.0, "w_penalty": 0.0, "lambda_z": 0.0, "bias": "", "impl": "OLNNMoE"},
 ]
 
 for exp in experiments:
-    exp_name = f"{exp['impl']}_load{exp['w_load']}_imp{exp['w_importance']}_z-loss{exp['lambda_z']}_penalty{exp['w_penalty']}_bias{exp['bias']}"
+    exp_name = f"{exp['impl']}_load{exp['w_load']}_imp{exp['w_importance']}_z-loss{exp['lambda_z']}_penalty{exp['w_penalty']}_bias{'False' if exp['bias'] == '' else str(exp['bias'])}"
     print(f"\n>>> Starting experiment: {exp_name}")
 
     cmd = [

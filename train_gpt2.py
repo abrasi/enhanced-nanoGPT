@@ -90,7 +90,10 @@ class CondMLP(nn.Module):
         self.c_proj.NANOGPT_SCALE_INIT = 1
         
         # Bias de DeepSeek
-        self.bias = nn.Parameter(torch.empty(self.n_paths)) if config.bias else None
+        if config.bias:
+            self.register_buffer("bias", torch.zeros(self.n_experts, dtype=torch.float32))
+        else:
+            self.bias = None
         
         self.register_buffer("total_assigment_count", torch.zeros(self.n_paths, dtype=torch.long))
         
@@ -158,9 +161,7 @@ class CondMLP(nn.Module):
     def __get_selection(self, prob):
         B, T, _ = prob.size()
         selection = torch.multinomial(prob.view(B*T, -1), 1).view(B, T)
-        # r = torch.rand_like(guess)
-        # g = guess + .1 * (torch.log(r) - torch.log(1. - r))
-        # selection = torch.argmax(g, dim=2)
+
         return selection
 
     def forward(self, x):
@@ -217,7 +218,10 @@ class GShardMoE(nn.Module):
         # Pesos do gate
         self.gate = nn.Linear(config.n_embd, self.n_experts, bias=False)
         # Bias de DeepSeek
-        self.bias = nn.Parameter(torch.empty(self.n_experts)) if config.bias else None
+        if config.bias:
+            self.register_buffer("bias", torch.zeros(self.n_experts, dtype=torch.float32))
+        else:
+            self.bias = None
         
         self.register_buffer("total_assigment_count", torch.zeros(self.n_experts, dtype=torch.long))
         self.register_buffer("total_dropped_count", torch.tensor(0, dtype=torch.long))
@@ -374,7 +378,10 @@ class SwitchMoE(nn.Module):
         # Pesos do gate
         self.gate = nn.Linear(config.n_embd, self.n_experts, bias=False)
         # Bias de DeepSeek
-        self.bias = nn.Parameter(torch.empty(self.n_experts)) if config.bias else None
+        if config.bias:
+            self.register_buffer("bias", torch.zeros(self.n_experts, dtype=torch.float32))
+        else:
+            self.bias = None
         
         self.register_buffer("total_assigment_count", torch.zeros(self.n_experts, dtype=torch.long))
         self.register_buffer("total_dropped_count", torch.tensor(0, dtype=torch.long))
@@ -558,7 +565,10 @@ class OLNNMoE(nn.Module):
         # Pesos de ruido gaussiano
         self.noise_layer = nn.Linear(config.n_embd, self.n_experts, bias=False)
         # Bias de DeepSeek
-        self.bias = nn.Parameter(torch.empty(self.n_experts)) if config.bias else None
+        if config.bias:
+            self.register_buffer("bias", torch.zeros(self.n_experts, dtype=torch.float32))
+        else:
+            self.bias = None
         
         self.register_buffer("total_assigment_count", torch.zeros(self.n_experts, dtype=torch.long))
         
@@ -982,7 +992,7 @@ def update_moe_layer_bias(moe_layer, gamma):
     # Promedio local de tokens para este MoE layer
     avg_tokens = tokens_per_expert.mean()
     
-    # Definir umbrales locales
+    # Definir limiares locais, 20%
     overload_threshold = avg_tokens * 1.2
     underload_threshold = avg_tokens * 0.8
 

@@ -255,13 +255,16 @@ class GShardMoE(nn.Module):
 
         return self.w_load * self.n_experts * (f_i * P_i).sum()
     
-    def get_importance_loss(self, G):
-
-        importance = G.sum(dim=0)  # suma por experto → (n_experts,)
-        mean = importance.mean()
-        var = importance.var(unbiased=False)
-        cv_squared = var / (mean ** 2)  # evitar división por 0
-        return self.w_importance * cv_squared
+    def get_importance_loss(self, probs, selected_experts):
+    
+        probs = probs.unsqueeze(1)
+        selected_experts = selected_experts.unsqueeze(1)
+                
+        importance = torch.zeros(self.n_experts, device=probs.device, dtype=probs.dtype)
+        
+        importance.scatter_add_(0, selected_experts.view(-1), probs.view(-1))
+        cv2 = importance.var(unbiased=False) / (torch.mean(importance)**2)
+        return self.w_importance * cv2
         
     def get_z_loss(self, gate_logits):
         logsumexp = torch.logsumexp(gate_logits, dim=-1)
@@ -292,10 +295,6 @@ class GShardMoE(nn.Module):
         if self.bias is not None:
             gate_logits += self.bias
             
-        if self.w_penalty > 0:
-            self.penalty = self.w_penalty * self.get_penalty(gate_logits)
-            auxiliary_loss += self.penalty
-            
         if self.lambda_z > 0:
             self.z_loss = self.get_z_loss(gate_logits)
             auxiliary_loss += self.z_loss
@@ -305,6 +304,10 @@ class GShardMoE(nn.Module):
             dim=-1,
             dtype=torch.float,
         ).type_as(x)
+        
+        if self.w_penalty > 0:
+            self.penalty = self.w_penalty * self.get_penalty(gate_logits)
+            auxiliary_loss += self.penalty
         
         # K = 2 constante xa que modificalo implicaría reimplementar o algoritmo do paper GShard
         weights, selected_experts = torch.topk(probs, k=2, dim=-1)
@@ -337,7 +340,7 @@ class GShardMoE(nn.Module):
         G += g2_normalized.unsqueeze(1) * top2_onehot * (top2_capacity_mask & top2_stochastic_mask)
             
         if self.w_importance > 0:
-            self.importance_loss = self.get_importance_loss(G)
+            self.importance_loss = self.get_importance_loss(weights, selected_experts)
             auxiliary_loss += self.importance_loss
             
         with torch.no_grad():
@@ -476,10 +479,6 @@ class SwitchMoE(nn.Module):
         if self.bias is not None:
             gate_logits += self.bias
         
-        if self.w_penalty > 0:
-            self.penalty = self.w_penalty * self.get_penalty(gate_logits)
-            auxiliary_loss += self.penalty
-        
         if self.lambda_z > 0:
             self.z_loss = self.get_z_loss(gate_logits)
             auxiliary_loss += self.z_loss
@@ -489,6 +488,10 @@ class SwitchMoE(nn.Module):
             dim=-1,
             dtype=torch.float,
         ).type_as(x)
+        
+        if self.w_penalty > 0:
+            self.penalty = self.w_penalty * self.get_penalty(gate_logits)
+            auxiliary_loss += self.penalty
         
         top1_weight, top1_idx = torch.max(router_probs, dim=-1)
         
@@ -642,11 +645,6 @@ class OLNNMoE(nn.Module):
         # (B*T, n_experts) -> por cada token obtéñense os logits de cada experto
         gate_logits = self.gate(x_squashed)
         
-        # Calculamos o penalty da implementación de Brais
-        if self.w_penalty > 0:
-            self.penalty = self.get_penalty(gate_logits)
-            auxiliary_loss += self.penalty
-        
         # Calculamos o z-loss
         if self.lambda_z > 0:
             self.z_loss = self.get_z_loss(gate_logits)
@@ -655,6 +653,11 @@ class OLNNMoE(nn.Module):
         # Introducimos ruido gaussiano ós logits dos expertos
         noise_std = F.softplus(self.noise_layer(x_squashed))
         gate_logits += torch.randn_like(gate_logits) * noise_std
+        
+        # Calculamos o penalty da implementación de Brais
+        if self.w_penalty > 0:
+            self.penalty = self.get_penalty(gate_logits)
+            auxiliary_loss += self.penalty
         
         # Engadimos o bias de DeepSeek
         if self.bias is not None:
@@ -1173,13 +1176,12 @@ def run_training(gptconfig: GPTConfig, log_dir):
                     if master_process:
                         print("Zeroed out the bias update speed in the MoE layer -> 97%% of training done")
                     
-                if gamma > 0:
                     
-                    for block in model.module.transformer.h: 
-                        if hasattr(block, 'moe_layer'): 
-                            update_moe_layer_bias(block.moe_layer, gamma)
-            #--------------------------------           
-            
+                for block in model.module.transformer.h: 
+                    if hasattr(block, 'moe_layer'): 
+                        update_moe_layer_bias(block.moe_layer, gamma)
+            #-------------------------------------------
+
             # Reseteamos os contadores de asignación de expertos para realizar o conteo despois do gradient accumulation
             for block in model.module.transformer.h:
                 block.moe_layer.reset_stats()
@@ -1241,7 +1243,7 @@ def run_training(gptconfig: GPTConfig, log_dir):
                 param_group['lr'] = lr
                 
                     
-            # Conteo os tokens asignados a cada experto
+            # Conteo dos tokens asignados a cada experto ---------------------
             layer_counts = []
             layer_dropped_counts = []
             for block in model.module.transformer.h:
@@ -1269,7 +1271,7 @@ def run_training(gptconfig: GPTConfig, log_dir):
                 dropped_percentage = mean_dropped / (total_batch_size / ddp_world_size)
             else:
                 dropped_percentage = 0
-            # ------------------------------------------
+            # ------------------------------------------------------------
             
             
             optimizer.step()

@@ -6,3 +6,5 @@ log*
 results
 launcher_log.txt
 bigger_model*
+scaled*
+base_*

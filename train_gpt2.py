@@ -91,7 +91,7 @@ class CondMLP(nn.Module):
         
         # Bias de DeepSeek
         if config.bias:
-            self.register_buffer("bias", torch.zeros(self.n_experts, dtype=torch.float32))
+            self.register_buffer("bias", torch.zeros(self.n_paths, dtype=torch.float32))
         else:
             self.bias = None
         
@@ -735,21 +735,22 @@ class Block(nn.Module):
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
-        if config.moe_implementation == "OLNNMoE":
-            self.moe_layer = OLNNMoE(config)
-        elif config.moe_implementation == "SwitchMoE":
-            self.moe_layer = SwitchMoE(config)
-        elif config.moe_implementation == "GShardMoE":
-            self.moe_layer = GShardMoE(config)
-        elif config.moe_implementation == "CondMLP":
-            self.moe_layer = CondMLP(config)
+        # if config.moe_implementation == "OLNNMoE":
+        #     self.moe_layer = OLNNMoE(config)
+        # elif config.moe_implementation == "SwitchMoE":
+        #     self.moe_layer = SwitchMoE(config)
+        # elif config.moe_implementation == "GShardMoE":
+        #     self.moe_layer = GShardMoE(config)
+        # elif config.moe_implementation == "CondMLP":
+        #     self.moe_layer = CondMLP(config)
+        self.moe_layer = FFN(config)  # Para probar o modelo sen MoE, usar FFN como capa de expertos
 
     def forward(self, x):
         # Aqui en la atención los tokens se "comunican" entre ellos
         x = x + self.attn(self.ln_1(x)) # sumamos la salida de una capa a la entrada para evitar el problema del GRADIENT VANISHING -> conexión residual
         # Aqui los tokens "piensan" individualmente
-        x2, auxiliary_loss = self.moe_layer(self.ln_2(x))
-        return x + x2, auxiliary_loss
+        x2 = self.moe_layer(self.ln_2(x))
+        return x + x2
 
 @dataclass
 class GPTConfig:
@@ -813,15 +814,15 @@ class GPT(nn.Module):
         
         
         # ----- Auxilary loss for MoE -----
-        total_auxilary_loss = 0
-        num_blocks = len(self.transformer.h)
+        # total_auxilary_loss = 0
+        # num_blocks = len(self.transformer.h)
         
         # forward the blocks of the transformer
         for block in self.transformer.h:
-            x, auxilary_loss = block(x)
-            total_auxilary_loss += auxilary_loss
+            x = block(x)
+            # total_auxilary_loss += auxilary_loss
         
-        mean_auxilary_loss = total_auxilary_loss / num_blocks
+        # mean_auxilary_loss = total_auxilary_loss / num_blocks
         # ----- Auxilary loss for MoE -----
         
         
@@ -831,7 +832,7 @@ class GPT(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-            loss += mean_auxilary_loss
+            # loss += mean_auxilary_loss
         return logits, loss
 
     @classmethod
@@ -1183,11 +1184,11 @@ def run_training(gptconfig: GPTConfig, log_dir):
             #-------------------------------------------
 
             # Reseteamos os contadores de asignación de expertos para realizar o conteo despois do gradient accumulation
-            for block in model.module.transformer.h:
-                block.moe_layer.reset_stats()
+            # for block in model.module.transformer.h:
+            #     block.moe_layer.reset_stats()
 
             # Inicializamos os acumuladores dos losses auxiliares
-            aux_losses = {'importance_loss': 0.0, 'load_loss': 0.0, 'z_loss': 0.0, 'penalty': 0.0}
+            # aux_losses = {'importance_loss': 0.0, 'load_loss': 0.0, 'z_loss': 0.0, 'penalty': 0.0}
             
             loss_accum = 0.0
             for micro_step in range(grad_accum_steps):
@@ -1205,13 +1206,13 @@ def run_training(gptconfig: GPTConfig, log_dir):
                 loss = loss / grad_accum_steps
                 loss_accum += loss.detach()
                 
-                with torch.no_grad():
-                    for block in model.module.transformer.h:
-                        moe = block.moe_layer
-                        aux_losses['importance_loss']  += getattr(moe, 'importance_loss', 0.0)
-                        aux_losses['load_loss'] += getattr(moe, 'load_loss',       0.0)
-                        aux_losses['z_loss']    += getattr(moe, 'z_loss',          0.0)
-                        aux_losses['penalty']  += getattr(moe, 'penalty',         0.0)
+                # with torch.no_grad():
+                #     for block in model.module.transformer.h:
+                #         moe = block.moe_layer
+                #         aux_losses['importance_loss']  += getattr(moe, 'importance_loss', 0.0)
+                #         aux_losses['load_loss'] += getattr(moe, 'load_loss',       0.0)
+                #         aux_losses['z_loss']    += getattr(moe, 'z_loss',          0.0)
+                #         aux_losses['penalty']  += getattr(moe, 'penalty',         0.0)
                 
                 loss.backward()
                 
@@ -1220,19 +1221,19 @@ def run_training(gptconfig: GPTConfig, log_dir):
                 
         
             # Promediamos as perdas auxiliares
-            num_layers = len(model.module.transformer.h)
-            for k in aux_losses:
-                aux_losses[k] /= (grad_accum_steps * num_layers)
-                if not torch.is_tensor(aux_losses[k]):
-                    aux_losses[k] = torch.tensor(aux_losses[k], device=device)
-                else:
-                    aux_losses[k] = aux_losses[k].to(device)
+            # num_layers = len(model.module.transformer.h)
+            # for k in aux_losses:
+            #     aux_losses[k] /= (grad_accum_steps * num_layers)
+            #     if not torch.is_tensor(aux_losses[k]):
+            #         aux_losses[k] = torch.tensor(aux_losses[k], device=device)
+            #     else:
+            #         aux_losses[k] = aux_losses[k].to(device)
 
-            if ddp:
-                for v in aux_losses.values():
-                    dist.all_reduce(v, op=dist.ReduceOp.AVG)
+            # if ddp:
+            #     for v in aux_losses.values():
+            #         dist.all_reduce(v, op=dist.ReduceOp.AVG)
 
-            aux_losses = {k: v.item() for k, v in aux_losses.items()}
+            # aux_losses = {k: v.item() for k, v in aux_losses.items()}
             #------------------------------------
             
             
@@ -1244,33 +1245,33 @@ def run_training(gptconfig: GPTConfig, log_dir):
                 
                     
             # Conteo dos tokens asignados a cada experto ---------------------
-            layer_counts = []
-            layer_dropped_counts = []
-            for block in model.module.transformer.h:
+            # layer_counts = []
+            # layer_dropped_counts = []
+            # for block in model.module.transformer.h:
                 
-                moe = block.moe_layer
-                if hasattr(moe, 'total_assigment_count'):
-                    layer_counts.append(moe.total_assigment_count.clone())
+            #     moe = block.moe_layer
+            #     if hasattr(moe, 'total_assigment_count'):
+            #         layer_counts.append(moe.total_assigment_count.clone())
                     
-                if hasattr(moe, "total_dropped_count"):
-                    layer_dropped_counts.append(moe.total_dropped_count.clone())
+            #     if hasattr(moe, "total_dropped_count"):
+            #         layer_dropped_counts.append(moe.total_dropped_count.clone())
                     
-            # Promediamos os contadores de asignación de expertos e dropped tokens de habelos entre os bloques e logo as GPUs
-            mean_assignments = torch.stack(layer_counts).float().mean(dim=0)
-            if len(layer_dropped_counts) > 0:
-                mean_dropped = torch.stack(layer_dropped_counts).float().mean().unsqueeze(0)
+            # # Promediamos os contadores de asignación de expertos e dropped tokens de habelos entre os bloques e logo as GPUs
+            # mean_assignments = torch.stack(layer_counts).float().mean(dim=0)
+            # if len(layer_dropped_counts) > 0:
+            #     mean_dropped = torch.stack(layer_dropped_counts).float().mean().unsqueeze(0)
             
-            if ddp:
-                dist.all_reduce(mean_assignments, op=dist.ReduceOp.AVG)
-                if len(layer_dropped_counts) > 0:
-                    dist.all_reduce(mean_dropped, op=dist.ReduceOp.AVG)
+            # if ddp:
+            #     dist.all_reduce(mean_assignments, op=dist.ReduceOp.AVG)
+            #     if len(layer_dropped_counts) > 0:
+            #         dist.all_reduce(mean_dropped, op=dist.ReduceOp.AVG)
             
-            # Definimos as porcentaxes para mostralas nas métricas     
-            assigment_percentage = mean_assignments / (total_batch_size / ddp_world_size)
-            if len(layer_dropped_counts) > 0:
-                dropped_percentage = mean_dropped / (total_batch_size / ddp_world_size)
-            else:
-                dropped_percentage = 0
+            # # Definimos as porcentaxes para mostralas nas métricas     
+            # assigment_percentage = mean_assignments / (total_batch_size / ddp_world_size)
+            # if len(layer_dropped_counts) > 0:
+            #     dropped_percentage = mean_dropped / (total_batch_size / ddp_world_size)
+            # else:
+            #     dropped_percentage = 0
             # ------------------------------------------------------------
             
             
@@ -1284,29 +1285,29 @@ def run_training(gptconfig: GPTConfig, log_dir):
             tokens_per_sec = tokens_processed / dt
             if master_process:
                 
-                parts = [
-                    "{k} {v:.3e}".format(k=k, v=v)
-                    for k, v in aux_losses.items()
-                    if abs(v) > 0
-                ]            
-                loss_str = " | ".join(parts)
+                # parts = [
+                #     "{k} {v:.3e}".format(k=k, v=v)
+                #     for k, v in aux_losses.items()
+                #     if abs(v) > 0
+                # ]            
+                # loss_str = " | ".join(parts)
                 msg = (f"step {step:5d} | loss: {loss_accum.item():.6f} "
                         f"| lr {lr:.4e} | norm: {norm:.4f} "
                         f"| dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
                 
-                if loss_str:
-                    msg += " | " + loss_str
+                # if loss_str:
+                #     msg += " | " + loss_str
                     
                 print(msg)
                 
                 with open(log_file, "a") as f:
                     f.write(f"{step} train {loss_accum.item():.6f}")
-                    for k, v in aux_losses.items():
-                        if abs(v) > 0:
-                            f.write(f" {k} {v:.3e}")
-                    f.write(f" expert_assignment_percentage {assigment_percentage.tolist()}")
-                    if len(layer_dropped_counts) > 0:
-                        f.write(f" dropped_percentage {dropped_percentage.item()*100:.2f}%")
+                    # for k, v in aux_losses.items():
+                    #     if abs(v) > 0:
+                    #         f.write(f" {k} {v:.3e}")
+                    # f.write(f" expert_assignment_percentage {assigment_percentage.tolist()}")
+                    # if len(layer_dropped_counts) > 0:
+                    #     f.write(f" dropped_percentage {dropped_percentage.item()*100:.2f}%")
                     f.write("\n")
 
         mes = monitor.end_window("epoch")
@@ -1346,7 +1347,12 @@ if __name__ == "__main__":
     if ddp:
         # use of DDP atm demands CUDA, we set the device appropriately according to rank
         assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-        init_process_group(backend='nccl')
+        init_process_group(
+        backend="nccl",
+        init_method="tcp://127.0.0.1:29500",
+        world_size=2,
+        rank=int(os.environ["RANK"]),
+        )
         ddp_rank = int(os.environ['RANK'])
         ddp_local_rank = int(os.environ['LOCAL_RANK'])
         ddp_world_size = int(os.environ['WORLD_SIZE'])
@@ -1406,6 +1412,6 @@ if __name__ == "__main__":
     )
     
     exp_name = args.exp_name or f"{args.moe_implementation}_load{args.w_load}_imp{args.w_importance}"
-    log_dir  = os.path.join("log", exp_name)
+    log_dir  = os.path.join("base_small_nanoGPT", exp_name)
     
     run_training(config, log_dir)

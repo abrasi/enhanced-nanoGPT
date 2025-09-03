@@ -1,3 +1,5 @@
+# Script para o adestramento de nanoGPT con MoE
+
 import os
 import math
 import time
@@ -95,14 +97,16 @@ class CondMLP(nn.Module):
         else:
             self.bias = None
         
+        # Buffer de contadores de asignacións a expertos
         self.register_buffer("total_assigment_count", torch.zeros(self.n_paths, dtype=torch.long))
         
+        # Peso para o loss de balanceo de importancia
         self.w_importance = config.w_importance
         # Peso para o loss de balanceo de carga dos expertos
         self.w_load = config.w_load
-        # Peso para o loss de penalización de logits grandes
+        # Peso para a perda-z
         self.lambda_z = config.lambda_z
-        # Peso para o loss de Brais
+        # Peso para o loss de penalización
         self.w_penalty = config.w_penalty
         
         self.importance_loss = 0.0
@@ -129,11 +133,11 @@ class CondMLP(nn.Module):
         B, T, E = prob.shape
         S = B * T
 
-        # f_i: fracción de tokens cuyo top-1 es el experto i
+        # f_i: fracción de tokens cuxo top-1 é o experto i
         selection_flat = selection.view(-1)  # (S,)
         f_i = torch.bincount(selection_flat, minlength=E).float() / S  # (E,)
 
-        # P_i: probabilidad media que el router asignó al experto i
+        # P_i: probabilidade media que o router asignou ao experto i
         P_i = prob.view(-1, E).mean(dim=0)
         
         return self.w_load * E * torch.sum(f_i * P_i)
@@ -147,7 +151,6 @@ class CondMLP(nn.Module):
         selection_flat = selection.view(S, 1)
         weights = torch.gather(probs_flat, 1, selection_flat)
 
-        # Construir tensor disperso G: (S, E) con ceros salvo en el experto top-1
         G = torch.zeros_like(probs_flat)
         G.scatter_(1, selection_flat, weights)
 
@@ -223,7 +226,10 @@ class GShardMoE(nn.Module):
         else:
             self.bias = None
         
+        # Buffer de contadores de asignacións a expertos
         self.register_buffer("total_assigment_count", torch.zeros(self.n_experts, dtype=torch.long))
+        
+        # Buffer contador de tokens descartados
         self.register_buffer("total_dropped_count", torch.tensor(0, dtype=torch.long))
         
         # Capacidade dos expertos
@@ -233,9 +239,9 @@ class GShardMoE(nn.Module):
         self.w_importance = config.w_importance
         # Peso para o loss de balanceo de carga dos expertos
         self.w_load = config.w_load
-        # Peso para o loss de penalización de logits grandes
+        # Peso para a perda-z
         self.lambda_z = config.lambda_z
-        # Peso para o loss de Brais
+        # Peso para o loss de penalización
         self.w_penalty = config.w_penalty
         
         self.importance_loss = 0.0
@@ -309,7 +315,6 @@ class GShardMoE(nn.Module):
             self.penalty = self.w_penalty * self.get_penalty(gate_logits)
             auxiliary_loss += self.penalty
         
-        # K = 2 constante xa que modificalo implicaría reimplementar o algoritmo do paper GShard
         weights, selected_experts = torch.topk(probs, k=2, dim=-1)
         g1, g2 = weights[:, 0], weights[:, 1]
         e1, e2 = selected_experts[:, 0], selected_experts[:, 1]
@@ -324,7 +329,6 @@ class GShardMoE(nn.Module):
         # Almacenamos os pesos dos top-1 expertos que non cubriron a súa capacidade
         G = g1_normalized.unsqueeze(1) * top1_onehot * top1_capacity_mask
                 
-        # Calcular pérdida auxiliar
         if self.w_load > 0:
             self.load_loss = self.get_load_balance_loss(probs, top1_onehot)
             auxiliary_loss += self.load_loss
@@ -386,7 +390,10 @@ class SwitchMoE(nn.Module):
         else:
             self.bias = None
         
+        # Buffer de contadores de asignacións a expertos
         self.register_buffer("total_assigment_count", torch.zeros(self.n_experts, dtype=torch.long))
+
+        # Buffer contador de tokens descartados
         self.register_buffer("total_dropped_count", torch.tensor(0, dtype=torch.long))
         
         # Capacidade dos expertos
@@ -396,9 +403,9 @@ class SwitchMoE(nn.Module):
         self.w_importance = config.w_importance
         # Peso para o loss de balanceo de carga dos expertos
         self.w_load = config.w_load
-        # Peso para o loss de penalización de logits grandes
+        # Peso para a perda-z
         self.lambda_z = config.lambda_z
-        # Peso para o loss de Brais
+        # Peso para o loss de penalización
         self.w_penalty = config.w_penalty
         
         self.importance_loss = 0.0
@@ -419,31 +426,24 @@ class SwitchMoE(nn.Module):
           
     def get_load_balance_loss(self, router_probs, expert_onehot):
         
-        """
-        router_probs: Tensor que representa la probabilidad de que un token sea enviado a cada experto -> dimension (B, T, n_experts)
-        expert_onehot: Tensor que representa el experto seleccionado para cada token -> dimension (B, T, n_experts)
-        """
-        
         expert_onehot = expert_onehot.reshape(-1, self.n_experts)
         router_probs = router_probs.reshape(-1, self.n_experts)
-        
-        # Tensor que representa la fraccion de los tokens enviados a cada experto -> dimension (n_experts, 1)
+
+        # Tensor que representa a fracción dos tokens enviados a cada experto -> dimensión (n_experts, 1)
         f_i = expert_onehot.float().mean(dim=0)
-        # NOTA: la suma de las fracciones entre los expertos no tiene por qué ser 1, porque hay tokens que no se envían a ningún experto -> Dropped Tokens
-        
-        # Representa la probabilidad total de que un token sea enviado a cada experto -> dimension (n_experts, 1)
+        # NOTA: a suma das fraccións entre os expertos non ten por que ser 1, porque hai tokens que non se envían a ningún experto -> Dropped Tokens
+
+        # Representa a probabilidade total de que un token sexa enviado a cada experto -> dimensión (n_experts, 1)
         P_i = router_probs.mean(dim=0)
 
         return self.w_load * self.n_experts * torch.sum(f_i * P_i)
         
     def get_importance_loss(self, probs, selected_experts):
         
-        
-        # Tenemos un tensor probs de forma (B*T, topk) y necesitamos uno de forma (B*T, n_experts)
         B_T, _ = probs.shape
         probs_expanded = torch.zeros(B_T, self.n_experts, device=probs.device, dtype=probs.dtype)
         
-        # Esta operacion introduce a la dimensión 1, en los índices selected_experts, los pesos de los expertos probs
+        # Esta operacion introduce á dimensión 1, nos índices selected_experts, os pesos dos expertos probs
         probs_expanded.scatter_(1, selected_experts, probs)
         
         importance = probs_expanded.sum(dim=0)
@@ -475,7 +475,6 @@ class SwitchMoE(nn.Module):
         
         gate_logits = self.gate(x_flat)
         
-        # Engadimos o bias de DeepSeek
         if self.bias is not None:
             gate_logits += self.bias
         
@@ -530,12 +529,11 @@ class SwitchMoE(nn.Module):
     def forward(self, x):
         
         expert_index, router_probs, auxiliary_loss, x_flat, B, T = self.route(x)
-        
-        # Indices de los expertos seleccionados
-        
+                
         # Inicializamos as saídas a 0 para os dropped tokens
         next_states = torch.zeros_like(x_flat)
         
+        # Iteración sobre os expertos e acumulación de resultados
         for idx in range(self.n_experts):
             
             expert_mask = expert_index[:, idx].bool()
@@ -544,9 +542,7 @@ class SwitchMoE(nn.Module):
                 
         next_states = next_states.view(B, T, -1)
         router_probs = router_probs.view(B, T, 1)
-            
-        # La salida se multiplica por la probabilidad de cada experto
-        # Duda: tiene sentido multiplicar por la probabilidad de cada experto si hay tokens que no se envían a ningún experto?
+
         x2 = router_probs * next_states
         
         return x2, auxiliary_loss
@@ -573,6 +569,7 @@ class OLNNMoE(nn.Module):
         else:
             self.bias = None
         
+        # Buffer de contadores de asignacións a expertos
         self.register_buffer("total_assigment_count", torch.zeros(self.n_experts, dtype=torch.long))
         
         # Top-k expertos a seleccionar por token
@@ -582,9 +579,9 @@ class OLNNMoE(nn.Module):
         self.w_importance = config.w_importance
         # Peso para o loss de balanceo de carga dos expertos
         self.w_load = config.w_load
-        # Peso para o loss de penalización de logits grandes
+        # Peso para a perda-z
         self.lambda_z = config.lambda_z
-        # Peso para o loss de Brais
+        # Peso para o loss de penalización
         self.w_penalty = config.w_penalty
         
     @torch.no_grad()
@@ -653,8 +650,8 @@ class OLNNMoE(nn.Module):
         # Introducimos ruido gaussiano ós logits dos expertos
         noise_std = F.softplus(self.noise_layer(x_squashed))
         gate_logits += torch.randn_like(gate_logits) * noise_std
-        
-        # Calculamos o penalty da implementación de Brais
+
+        # Calculamos o penalty
         if self.w_penalty > 0:
             self.penalty = self.get_penalty(gate_logits)
             auxiliary_loss += self.penalty

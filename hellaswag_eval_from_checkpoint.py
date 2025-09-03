@@ -1,7 +1,9 @@
+# Script para evaluación de HellaSwag desde un checkpoint gardado previamente
+
 import torch
 import torch.distributed as dist
 from torch.serialization import safe_globals
-from train_gpt2 import GPT, GPTConfig, iterate_examples, render_example, get_most_likely_row
+from train_MoEgpt2 import GPT, GPTConfig, iterate_examples, render_example, get_most_likely_row
 
 # Cargar modelo
 checkpoint_path = "./log/model_19072.pt"

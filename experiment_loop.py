@@ -1,3 +1,5 @@
+# Script de execución automática de experimentos
+
 import subprocess
 import os
 
@@ -39,7 +41,7 @@ for exp in experiments:
     print(f"\n>>> Starting experiment: {exp_name}")
 
     cmd = [
-        "torchrun", "--nproc_per_node=2", "train_gpt2.py",
+        "torchrun", "--nproc_per_node=2", "train_MoEgpt2.py",
         "--w_load", str(exp["w_load"]),
         "--w_importance", str(exp["w_importance"]),
         "--w_penalty", str(exp["w_penalty"]),

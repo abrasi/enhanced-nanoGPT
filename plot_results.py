@@ -11,22 +11,24 @@ import ast
 log_file = "./log.txt"
 train_losses = []
 val_losses = []
+hella_accuracies = []
 z_losses = []
 penalty_losses = []
 importance_losses = []
 load_losses = []
 steps_train = []
 steps_val = []
+steps_hella = []
 steps_z = []
 dropped_tokens = []
 expert_assignments = []
 
-# pattern = re.compile(
-#     r"^(\d+)\s+train\s+([\d.]+)\s+expert_assignment_percentage\s+(\[.*?\])\s+dropped_percentage\s+([\d.]+)%"
-# )
 pattern = re.compile(
-    r"^(\d+)\s+train\s+([\d.]+)(?:\s+importance_loss\s+([\d.eE+-]+))?\s+expert_assignment_percentage\s+(\[.*?\])\s+dropped_percentage\s+([\d.]+)%"  # "
+    r"^(\d+)\s+train\s+([\d.]+)\s+expert_assignment_percentage\s+"
 )
+# pattern = re.compile(
+#     r"^(\d+)\s+train\s+([\d.]+)(?:\s+importance_loss\s+([\d.eE+-]+))?\s+expert_assignment_percentage\s+(\[.*?\])\s+dropped_percentage\s+([\d.]+)%"  # "
+# )
 
 
 with open(log_file, "r") as f:
@@ -38,16 +40,16 @@ with open(log_file, "r") as f:
             train_loss = float(match.group(2))
             # load_loss = float(match.group(3))
             # z_loss = float(match.group(3))
-            importance_loss = float(match.group(3))
+            # importance_loss = float(match.group(3))
             # penalty = float(match.group(3))
-            percentages = ast.literal_eval(match.group(4))
-            dropped = float(match.group(5))
+            # percentages = ast.literal_eval(match.group(3))
+            # dropped = float(match.group(5))
 
             steps_train.append(step)
             train_losses.append(train_loss)
-            expert_assignments.append(percentages)
-            importance_losses.append(importance_loss)
-            dropped_tokens.append(dropped)
+            # expert_assignments.append(percentages)
+            # importance_losses.append(importance_loss)
+            # dropped_tokens.append(dropped)
             # load_losses.append(load_loss)
             # z_losses.append(z_loss)
             # penalty_losses.append(penalty)
@@ -60,23 +62,34 @@ with open(log_file, "r") as f:
                 val_loss = float(parts[2])
                 steps_val.append(step)
                 val_losses.append(val_loss)
+                
+        elif "hella" in line:
+            parts = line.strip().split()
+            if len(parts) >= 3:
+                step = int(parts[0])
+                hella_acc = float(parts[2])
+                steps_hella.append(step)
+                hella_accuracies.append(hella_acc)
         
 
 # Convertir listas a arrays para graficar
 train_losses = np.array(train_losses)
 val_losses = np.array(val_losses)
+hella_accuracies = np.array(hella_accuracies)
 importance_losses = np.array(importance_losses)
 # load_losses = np.array(load_losses)
 # z_losses = np.array(z_losses)
 # penalty_losses = np.array(penalty_losses)
-dropped_tokens = np.array(dropped_tokens)
-expert_assignments = np.array(expert_assignments)
+# dropped_tokens = np.array(dropped_tokens)
+# expert_assignments = np.array(expert_assignments)
 
 # Encontrar los mínimos
 min_train_loss = np.min(train_losses)
 min_train_epoch = steps_train[np.argmin(train_losses)]
 min_val_loss = np.min(val_losses)
 min_val_epoch = steps_val[np.argmin(val_losses)]
+max_hella_acc = np.max(hella_accuracies)
+max_hella_epoch = steps_hella[np.argmax(hella_accuracies)]
 
 # Graficar pérdidas
 plt.figure(figsize=(10, 5))
@@ -91,16 +104,30 @@ plt.legend()
 plt.grid()
 plt.show()
 
-
-# Importance loss
+# Graficar HellaSwag
 plt.figure(figsize=(10, 5))
-plt.plot(steps_train, importance_losses, label="Importance Loss", color='orange')
+plt.plot(steps_hella, hella_accuracies, label="HellaSwag Accuracy", color='blue')
+plt.scatter(max_hella_epoch, max_hella_acc, color='blue', marker='o', label=f'Max HellaSwag Accuracy: {max_hella_acc:.4f}')
+base_hella = 0.3105
+plt.axhline(y=base_hella, color='red', linestyle='--',
+            label=f'nanoGPT Max HellaSwag Accuracy: {base_hella:.4f}')
 plt.xlabel("Epochs")
-plt.ylabel("Loss")
-plt.title("Importance Loss Evolution")
+plt.ylabel("HellaSwag Accuracy")
+plt.title("HellaSwag Accuracy Evolution")
 plt.legend()
 plt.grid()
 plt.show()
+
+
+# Importance loss
+# plt.figure(figsize=(10, 5))
+# plt.plot(steps_train, importance_losses, label="Importance Loss", color='orange')
+# plt.xlabel("Epochs")
+# plt.ylabel("Loss")
+# plt.title("Importance Loss Evolution")
+# plt.legend()
+# plt.grid()
+# plt.show()
 
 # Load loss
 # plt.figure(figsize=(10, 5))
@@ -133,24 +160,24 @@ plt.show()
 # plt.show()
 
 # Gráfico de dropped tokens
-plt.figure(figsize=(10, 5))
-plt.plot(steps_train, dropped_tokens, label="Dropped Tokens (%)", color='purple')
-plt.title("Dropped Tokens Percentage")
-plt.xlabel("Epochs")
-plt.ylabel("Percentage (%)")
-plt.legend()
-plt.grid()
-plt.show()
+# plt.figure(figsize=(10, 5))
+# plt.plot(steps_train, dropped_tokens, label="Dropped Tokens (%)", color='purple')
+# plt.title("Dropped Tokens Percentage")
+# plt.xlabel("Epochs")
+# plt.ylabel("Percentage (%)")
+# plt.legend()
+# plt.grid()
+# plt.show()
 
 # Gráfico de asignación a expertos con stacked area plot
-plt.figure(figsize=(10, 5))
-plt.stackplot(steps_train, expert_assignments.T, labels=[f"Expert {i}" for i in range(expert_assignments.shape[1])], alpha=0.7)
-plt.title("Expert Assignment Proportions")
-plt.xlabel("Epochs")
-plt.ylabel("Proportion")
-plt.legend()
-plt.grid()
-plt.show()
+# plt.figure(figsize=(10, 5))
+# plt.stackplot(steps_train, expert_assignments.T, labels=[f"Expert {i}" for i in range(expert_assignments.shape[1])], alpha=0.7)
+# plt.title("Expert Assignment Proportions")
+# plt.xlabel("Epochs")
+# plt.ylabel("Proportion")
+# plt.legend()
+# plt.grid()
+# plt.show()
 
 print(f"Minimum Train Loss: {min_train_loss:.4f} at epoch {min_train_epoch}")
 print(f"Minimum Validation Loss: {min_val_loss:.4f} at epoch {min_val_epoch}")

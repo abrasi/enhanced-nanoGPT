@@ -1,17 +1,17 @@
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Datos (exemplo) - substituír polos reais
-implementacions = ["Liña base", "OLNNMoE", "SwitchMoE", "GShardMoE", "CondMLP"]
-consumo_zeus = [12.14, 19.88, 16.01, 17.21, 13.52]  
-consumo_calc = [21.60, 39.21, 31.55, 34.02, 25.20]  
-co2 = [3.69, 6.76, 7.12, 7.09, 4.31]  
+# Datos
+implementacions = ["nanoGPT 355M", "OLNNMoE + Nesgo balanceo"]
+consumo_zeus = [27.94, 76.08]  
+consumo_calc = [46.87, 204.07]  
+co2 = [8.02, 34.90]  
 
-# --- Histograma Consumo (Zeus e Calculadora) ---
+# Histograma Consumo (Zeus e Calculadora)
 x = np.arange(len(implementacions))
 width = 0.35
 
-plt.figure(figsize=(7,5))
+plt.figure(figsize=(10,8))
 bars1 = plt.bar(x - width/2, consumo_zeus, width, label="Zeus (kWh)")
 bars2 = plt.bar(x + width/2, consumo_calc, width, label="Calc. Online (kWh)")
 
@@ -28,7 +28,7 @@ for bars in [bars1, bars2]:
 plt.tight_layout()
 plt.show()
 
-# --- Histograma CO2 ---
+# Histograma CO2
 plt.figure(figsize=(7,5))
 bars = plt.bar(implementacions, co2, color="seagreen")
 
